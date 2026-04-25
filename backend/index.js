@@ -38,6 +38,7 @@ const gmail = google.gmail({
 });
 
 app.get("/health", (_request, response) => {
+    console.log("Health check received.");
     response.json({ ok: true });
 });
 
@@ -49,9 +50,13 @@ app.post(
     ]),
     async (request, response) => {
         try {
+            console.log("Upload request received.", {
+                contentType: request.headers["content-type"] || "unknown"
+            });
             const metadataFile = request.files?.metadata?.[0];
             const metadataText = metadataFile?.buffer.toString("utf8") || request.body?.metadata;
             if (!metadataText) {
+                console.error("Upload rejected: metadata missing.");
                 response.status(400).json({ message: "Missing metadata upload." });
                 return;
             }
@@ -63,12 +68,25 @@ app.post(
             const subject = String(metadata.deliverySubject || "Jentry submission");
             const body = String(metadata.deliveryBody || "");
 
+            console.log("Upload parsed.", {
+                submissionId: metadata.submissionId || "missing",
+                to,
+                from,
+                documentCount: documentFiles.length
+            });
+
             if (!to) {
+                console.error("Upload rejected: deliveryTo missing.", {
+                    submissionId: metadata.submissionId || "missing"
+                });
                 response.status(400).json({ message: "Missing deliveryTo in metadata." });
                 return;
             }
 
             if (documentFiles.length === 0) {
+                console.error("Upload rejected: no documents attached.", {
+                    submissionId: metadata.submissionId || "missing"
+                });
                 response.status(400).json({ message: "No documents were uploaded." });
                 return;
             }
@@ -92,12 +110,23 @@ app.post(
                 }
             });
 
+            console.log("Email sent successfully.", {
+                submissionId: metadata.submissionId || sendResult.data.id,
+                gmailMessageId: sendResult.data.id,
+                to,
+                documentCount: documentFiles.length
+            });
+
             response.json({
                 submissionId: metadata.submissionId || sendResult.data.id,
                 message: `Submission emailed to ${to} from ${from}.`
             });
         } catch (error) {
             const message = error instanceof Error ? error.message : "Unknown server error.";
+            console.error("Upload processing failed.", {
+                message,
+                stack: error instanceof Error ? error.stack : undefined
+            });
             response.status(500).json({ message });
         }
     }
