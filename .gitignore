@@ -1,0 +1,5 @@
+backend/.env
+backend/node_modules/
+backend/test.pdf
+backend/node
+backend/jentry-relay@1.0.0
