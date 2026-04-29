@@ -1,3 +1,7 @@
+const crypto = require("crypto");
+const fs = require("fs/promises");
+const path = require("path");
+
 const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
@@ -37,8 +41,18 @@ const gmail = google.gmail({
   auth: oauth2Client
 });
 
+const XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize";
+const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
+const XERO_CONNECTIONS_URL = "https://api.xero.com/connections";
+const XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices";
+
+const xeroAuthSessions = new Map();
+const dataDirectory = path.join(__dirname, "data");
+const xeroConnectionsPath = path.join(dataDirectory, "xero-connections.json");
+
 function toBase64Url(value) {
-  return Buffer.from(value)
+  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  return buffer
     .toString("base64")
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -102,6 +116,120 @@ function coerceNumber(value) {
 
 function coerceBoolean(value) {
   return Boolean(value);
+}
+
+function getSenderEmail() {
+  return (
+    process.env.GMAIL_SENDER_EMAIL ||
+    process.env.GMAIL_SENDER ||
+    process.env.JENTRY_BACKEND_SENDER_EMAIL ||
+    "theteam@jaccountancy.co.uk"
+  );
+}
+
+function xeroClientID() {
+  return String(process.env.XERO_CLIENT_ID || "").trim();
+}
+
+function xeroRedirectURI() {
+  return String(
+    process.env.XERO_REDIRECT_URI ||
+      "https://jentry-jentry.up.railway.app/oauth/xero/callback"
+  ).trim();
+}
+
+function xeroAppRedirectURI() {
+  return String(
+    process.env.JENTRY_XERO_APP_REDIRECT_URI || "jentry://oauth/xero/callback"
+  ).trim();
+}
+
+function xeroScopes() {
+  return String(
+    process.env.XERO_SCOPES ||
+      "openid profile email offline_access accounting.transactions accounting.contacts"
+  )
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
+}
+
+function xeroConfigured() {
+  return xeroClientID().length > 0 && xeroRedirectURI().length > 0;
+}
+
+async function ensureDataDirectory() {
+  await fs.mkdir(dataDirectory, { recursive: true });
+}
+
+async function readXeroConnections() {
+  await ensureDataDirectory();
+  try {
+    const raw = await fs.readFile(xeroConnectionsPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.accounts && typeof parsed.accounts === "object") {
+      return parsed;
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn("Failed to read Xero connection store.", error);
+    }
+  }
+
+  return { accounts: {} };
+}
+
+async function writeXeroConnections(store) {
+  await ensureDataDirectory();
+  await fs.writeFile(xeroConnectionsPath, JSON.stringify(store, null, 2));
+}
+
+async function getXeroConnection(accountId) {
+  const normalizedAccountId = String(accountId || "").trim();
+  if (!normalizedAccountId) {
+    return null;
+  }
+
+  const store = await readXeroConnections();
+  return store.accounts[normalizedAccountId] || null;
+}
+
+async function upsertXeroConnection(accountId, updater) {
+  const normalizedAccountId = String(accountId || "").trim();
+  if (!normalizedAccountId) {
+    throw new Error("Missing accountId.");
+  }
+
+  const store = await readXeroConnections();
+  const previous = store.accounts[normalizedAccountId] || null;
+  const next = await updater(previous);
+  store.accounts[normalizedAccountId] = next;
+  await writeXeroConnections(store);
+  return next;
+}
+
+async function deleteXeroConnection(accountId) {
+  const normalizedAccountId = String(accountId || "").trim();
+  const store = await readXeroConnections();
+  delete store.accounts[normalizedAccountId];
+  await writeXeroConnections(store);
+}
+
+function buildReturnURL(baseURL, params) {
+  const target = new URL(baseURL);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value != null && value !== "") {
+      target.searchParams.set(key, String(value));
+    }
+  });
+  return target.toString();
+}
+
+function createPKCEPair() {
+  const verifier = toBase64Url(crypto.randomBytes(32));
+  const challenge = toBase64Url(crypto.createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
 }
 
 async function sendEmail({ to, from, subject, body, attachments = [] }) {
@@ -235,9 +363,597 @@ function shapeAnalyzeResponse(parsed) {
   };
 }
 
+function parseJSONField(value, fallback) {
+  if (value == null || value === "") {
+    return fallback;
+  }
+
+  if (typeof value === "object") {
+    return value;
+  }
+
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function sanitizeTenants(connections) {
+  if (!Array.isArray(connections)) {
+    return [];
+  }
+
+  return connections
+    .map((connection) => ({
+      id: String(connection.id || connection.connectionId || "").trim(),
+      tenantId: String(connection.tenantId || "").trim(),
+      tenantName: String(connection.tenantName || "").trim(),
+      tenantType: String(connection.tenantType || "").trim(),
+      createdDateUtc: String(connection.createdDateUtc || "").trim(),
+      updatedDateUtc: String(connection.updatedDateUtc || "").trim()
+    }))
+    .filter((tenant) => tenant.tenantId && tenant.tenantName);
+}
+
+async function exchangeXeroToken(params) {
+  const body = new URLSearchParams(params);
+  const response = await fetch(XERO_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error_description || data.error || "Xero token exchange failed.");
+  }
+
+  return data;
+}
+
+async function fetchXeroTenants(accessToken) {
+  const response = await fetch(XERO_CONNECTIONS_URL, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json"
+    }
+  });
+
+  const data = await response.json().catch(() => []);
+  if (!response.ok) {
+    throw new Error("Failed to fetch Xero organisations.");
+  }
+
+  return sanitizeTenants(data);
+}
+
+function tokenExpiresSoon(expiresAt) {
+  if (!expiresAt) {
+    return true;
+  }
+  return new Date(expiresAt).getTime() - Date.now() < 120000;
+}
+
+async function ensureFreshXeroConnection(accountId) {
+  const connection = await getXeroConnection(accountId);
+  if (!connection) {
+    throw new Error("No Xero connection found for this account.");
+  }
+
+  if (!tokenExpiresSoon(connection.expiresAt)) {
+    return connection;
+  }
+
+  if (!connection.refreshToken) {
+    throw new Error("Xero connection cannot be refreshed.");
+  }
+
+  const tokenData = await exchangeXeroToken({
+    grant_type: "refresh_token",
+    client_id: xeroClientID(),
+    refresh_token: connection.refreshToken
+  });
+
+  const tenants = await fetchXeroTenants(tokenData.access_token);
+  return upsertXeroConnection(accountId, (previous) => {
+    const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
+    const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
+    return {
+      accountId: String(accountId),
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      idToken: tokenData.id_token || null,
+      scope: tokenData.scope || previous?.scope || xeroScopes(),
+      expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
+      connectedAt: previous?.connectedAt || new Date().toISOString(),
+      lastRefreshedAt: new Date().toISOString(),
+      tenants,
+      selectedTenantId: selectedTenant?.tenantId || null,
+      selectedTenantName: selectedTenant?.tenantName || null
+    };
+  });
+}
+
+function pickDocumentDate(extractedDocuments) {
+  const candidates = Array.isArray(extractedDocuments) ? extractedDocuments : [];
+  for (const document of candidates) {
+    if (typeof document?.dateISO === "string" && document.dateISO.trim()) {
+      return document.dateISO.trim().slice(0, 10);
+    }
+  }
+  return new Date().toISOString().slice(0, 10);
+}
+
+function buildBillLineItems(metadata) {
+  const extractedDocuments = Array.isArray(metadata.extractedDocuments)
+    ? metadata.extractedDocuments
+    : [];
+
+  const lineItems = [];
+  for (const document of extractedDocuments) {
+    const documentLineItems = Array.isArray(document?.lineItems) ? document.lineItems : [];
+    if (documentLineItems.length > 0) {
+      for (const item of documentLineItems) {
+        const rawAmount = String(item?.amountText || "").replace(/[^0-9.-]/g, "");
+        const parsedAmount = Number(rawAmount);
+        lineItems.push({
+          Description: String(item?.name || "Receipt line item").slice(0, 4000),
+          Quantity: Number(String(item?.quantity || "").replace(/[^0-9.-]/g, "")) || 1,
+          UnitAmount: Number.isFinite(parsedAmount) && parsedAmount !== 0 ? parsedAmount : undefined
+        });
+      }
+    } else {
+      const description = String(
+        document?.shortDescription ||
+          document?.summary ||
+          document?.merchant ||
+          "Receipt"
+      ).trim();
+      const parsedTotal = Number(document?.totalAmount);
+      lineItems.push({
+        Description: description.slice(0, 4000),
+        Quantity: 1,
+        UnitAmount: Number.isFinite(parsedTotal) && parsedTotal > 0 ? parsedTotal : undefined
+      });
+    }
+  }
+
+  if (lineItems.length > 0) {
+    return lineItems;
+  }
+
+  const descriptions = Array.isArray(metadata.descriptions) ? metadata.descriptions : [];
+  const fallbackDescription = descriptions.join(", ").slice(0, 4000) || "Jentry document submission";
+  return [
+    {
+      Description: fallbackDescription,
+      Quantity: 1
+    }
+  ];
+}
+
+function buildBillPayload(metadata) {
+  const extractedDocuments = Array.isArray(metadata.extractedDocuments)
+    ? metadata.extractedDocuments
+    : [];
+  const primaryDocument = extractedDocuments[0] || {};
+  const supplierName =
+    String(primaryDocument.merchant || "").trim() ||
+    `${String(metadata.companyName || "Jentry").trim()} supplier`;
+
+  const referenceBase =
+    String(primaryDocument.invoiceNumber || "").trim() ||
+    String(metadata.submissionId || "").trim() ||
+    `jentry-${Date.now()}`;
+
+  const lineItems = buildBillLineItems(metadata).map((item) => {
+    const cleaned = {
+      Description: item.Description,
+      Quantity: item.Quantity || 1
+    };
+    if (item.UnitAmount != null) {
+      cleaned.UnitAmount = item.UnitAmount;
+    }
+    return cleaned;
+  });
+
+  return {
+    Type: "ACCPAY",
+    Contact: {
+      Name: supplierName.slice(0, 255)
+    },
+    DateString: pickDocumentDate(extractedDocuments),
+    DueDateString: pickDocumentDate(extractedDocuments),
+    Status: "AUTHORISED",
+    LineAmountTypes: "Inclusive",
+    Reference: `${String(metadata.clientId || "").trim()} ${referenceBase}`.trim().slice(0, 255),
+    InvoiceNumber: referenceBase.slice(0, 255),
+    LineItems: lineItems
+  };
+}
+
+async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }) {
+  const attachmentURL = `${XERO_INVOICES_URL}/${invoiceId}/Attachments/${encodeURIComponent(file.originalname)}`;
+  const response = await fetch(attachmentURL, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "xero-tenant-id": tenantId,
+      Accept: "application/json",
+      "Content-Type": file.mimetype || "application/pdf",
+      "Content-Length": String(file.buffer.length),
+      "IncludeOnline": "true"
+    },
+    body: file.buffer
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Xero attachment upload failed: ${text || response.status}`);
+  }
+}
+
+async function createXeroBill(accountId, metadata, documentFiles) {
+  const connection = await ensureFreshXeroConnection(accountId);
+  if (!connection.selectedTenantId) {
+    throw new Error("No Xero organisation has been selected for this account.");
+  }
+
+  const billPayload = buildBillPayload(metadata);
+  const response = await fetch(XERO_INVOICES_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${connection.accessToken}`,
+      "xero-tenant-id": connection.selectedTenantId,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      Invoices: [billPayload]
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const details =
+      data?.Elements?.[0]?.ValidationErrors?.map((entry) => entry.Message).join("; ") ||
+      data?.Message ||
+      "Xero bill creation failed.";
+    throw new Error(details);
+  }
+
+  const invoice = data?.Invoices?.[0];
+  if (!invoice?.InvoiceID) {
+    throw new Error("Xero did not return an invoice ID.");
+  }
+
+  for (const file of documentFiles.slice(0, 10)) {
+    await uploadAttachmentToXero({
+      accessToken: connection.accessToken,
+      tenantId: connection.selectedTenantId,
+      invoiceId: invoice.InvoiceID,
+      file
+    });
+  }
+
+  return {
+    remoteSubmissionID: invoice.InvoiceID,
+    confirmationMessage: `Submission published directly to Xero for ${connection.selectedTenantName || "the selected organisation"}.`,
+    invoice
+  };
+}
+
+async function handleEmailUpload(metadata, documentFiles) {
+  const to = String(metadata.deliveryTo || "");
+  const from = String(metadata.preferredFromEmail || getSenderEmail());
+  const subject = String(metadata.deliverySubject || "Jentry submission");
+  const body = String(metadata.deliveryBody || "");
+
+  if (!to) {
+    throw new Error("Missing deliveryTo in metadata.");
+  }
+
+  if (documentFiles.length === 0) {
+    throw new Error("No documents were uploaded.");
+  }
+
+  const attachments = documentFiles.map((file) => ({
+    filename: file.originalname,
+    mimeType: file.mimetype || "application/octet-stream",
+    data: file.buffer
+  }));
+
+  const sendResult = await sendEmail({
+    to,
+    from,
+    subject,
+    body,
+    attachments
+  });
+
+  return {
+    submissionId: metadata.submissionId || sendResult.data.id,
+    message: `Submission emailed to ${to} from ${from}.`
+  };
+}
+
 app.get("/health", (_request, response) => {
   console.log("Health check received.");
   response.json({ ok: true });
+});
+
+app.get("/oauth/xero/start", async (request, response) => {
+  try {
+    if (!xeroConfigured()) {
+      response.status(500).json({ message: "Xero OAuth is not configured on the backend." });
+      return;
+    }
+
+    const accountId = String(request.query.accountId || "").trim();
+    if (!accountId) {
+      response.status(400).json({ message: "Missing accountId." });
+      return;
+    }
+
+    const returnUri = String(request.query.returnUri || xeroAppRedirectURI()).trim();
+    const { verifier, challenge } = createPKCEPair();
+    const state = crypto.randomUUID();
+
+    xeroAuthSessions.set(state, {
+      accountId,
+      returnUri,
+      verifier,
+      createdAt: Date.now()
+    });
+
+    const authorizeURL = new URL(XERO_AUTHORIZE_URL);
+    authorizeURL.searchParams.set("response_type", "code");
+    authorizeURL.searchParams.set("client_id", xeroClientID());
+    authorizeURL.searchParams.set("redirect_uri", xeroRedirectURI());
+    authorizeURL.searchParams.set("scope", xeroScopes());
+    authorizeURL.searchParams.set("state", state);
+    authorizeURL.searchParams.set("code_challenge", challenge);
+    authorizeURL.searchParams.set("code_challenge_method", "S256");
+
+    response.redirect(authorizeURL.toString());
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to start Xero authorization.";
+    response.status(500).json({ message });
+  }
+});
+
+app.get("/oauth/xero/callback", async (request, response) => {
+  const state = String(request.query.state || "").trim();
+  const authSession = xeroAuthSessions.get(state);
+  const fallbackReturnURL = authSession?.returnUri || xeroAppRedirectURI();
+
+  try {
+    if (!authSession) {
+      response.redirect(
+        buildReturnURL(fallbackReturnURL, {
+          status: "error",
+          message: "Missing or expired Xero authorization session."
+        })
+      );
+      return;
+    }
+
+    xeroAuthSessions.delete(state);
+
+    const authError = String(request.query.error || "").trim();
+    if (authError) {
+      response.redirect(
+        buildReturnURL(authSession.returnUri, {
+          accountId: authSession.accountId,
+          status: "error",
+          message: authError
+        })
+      );
+      return;
+    }
+
+    const code = String(request.query.code || "").trim();
+    if (!code) {
+      response.redirect(
+        buildReturnURL(authSession.returnUri, {
+          accountId: authSession.accountId,
+          status: "error",
+          message: "Authorization code missing."
+        })
+      );
+      return;
+    }
+
+    const tokenData = await exchangeXeroToken({
+      grant_type: "authorization_code",
+      client_id: xeroClientID(),
+      code,
+      redirect_uri: xeroRedirectURI(),
+      code_verifier: authSession.verifier
+    });
+
+    const tenants = await fetchXeroTenants(tokenData.access_token);
+    const selectedTenant = tenants[0] || null;
+
+    await upsertXeroConnection(authSession.accountId, () => ({
+      accountId: authSession.accountId,
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token,
+      idToken: tokenData.id_token || null,
+      scope: tokenData.scope || xeroScopes(),
+      expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
+      connectedAt: new Date().toISOString(),
+      lastRefreshedAt: new Date().toISOString(),
+      tenants,
+      selectedTenantId: selectedTenant?.tenantId || null,
+      selectedTenantName: selectedTenant?.tenantName || null
+    }));
+
+    response.redirect(
+      buildReturnURL(authSession.returnUri, {
+        accountId: authSession.accountId,
+        status: "connected",
+        tenantCount: tenants.length
+      })
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Xero connection failed.";
+    response.redirect(
+      buildReturnURL(fallbackReturnURL, {
+        accountId: authSession?.accountId || "",
+        status: "error",
+        message
+      })
+    );
+  }
+});
+
+app.get("/xero/status", async (request, response) => {
+  try {
+    const accountId = String(request.query.accountId || "").trim();
+    if (!accountId) {
+      response.status(400).json({ message: "Missing accountId." });
+      return;
+    }
+
+    const connection = await getXeroConnection(accountId);
+    if (!connection) {
+      response.json({
+        isConnected: false,
+        requiresReconnect: false,
+        selectedTenantId: null,
+        selectedTenantName: null,
+        tenants: []
+      });
+      return;
+    }
+
+    const fresh = await ensureFreshXeroConnection(accountId);
+    response.json({
+      isConnected: true,
+      requiresReconnect: false,
+      selectedTenantId: fresh.selectedTenantId || null,
+      selectedTenantName: fresh.selectedTenantName || null,
+      tenants: fresh.tenants || [],
+      connectedAt: fresh.connectedAt || null,
+      expiresAt: fresh.expiresAt || null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to fetch Xero status.";
+    response.status(500).json({
+      isConnected: false,
+      requiresReconnect: true,
+      message
+    });
+  }
+});
+
+app.get("/xero/tenants", async (request, response) => {
+  try {
+    const accountId = String(request.query.accountId || "").trim();
+    if (!accountId) {
+      response.status(400).json({ message: "Missing accountId." });
+      return;
+    }
+
+    const connection = await ensureFreshXeroConnection(accountId);
+    response.json({
+      tenants: connection.tenants || [],
+      selectedTenantId: connection.selectedTenantId || null,
+      selectedTenantName: connection.selectedTenantName || null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to load Xero organisations.";
+    response.status(500).json({ message });
+  }
+});
+
+app.post("/xero/select-tenant", async (request, response) => {
+  try {
+    const accountId = String(request.body?.accountId || "").trim();
+    const tenantId = String(request.body?.tenantId || "").trim();
+
+    if (!accountId || !tenantId) {
+      response.status(400).json({ message: "Missing accountId or tenantId." });
+      return;
+    }
+
+    const connection = await ensureFreshXeroConnection(accountId);
+    const selectedTenant = (connection.tenants || []).find((tenant) => tenant.tenantId === tenantId);
+    if (!selectedTenant) {
+      response.status(404).json({ message: "That Xero organisation was not found for this connection." });
+      return;
+    }
+
+    const updated = await upsertXeroConnection(accountId, (previous) => ({
+      ...previous,
+      selectedTenantId: selectedTenant.tenantId,
+      selectedTenantName: selectedTenant.tenantName
+    }));
+
+    response.json({
+      isConnected: true,
+      selectedTenantId: updated.selectedTenantId,
+      selectedTenantName: updated.selectedTenantName
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to select Xero organisation.";
+    response.status(500).json({ message });
+  }
+});
+
+app.post("/xero/disconnect", async (request, response) => {
+  try {
+    const accountId = String(request.body?.accountId || "").trim();
+    if (!accountId) {
+      response.status(400).json({ message: "Missing accountId." });
+      return;
+    }
+
+    await deleteXeroConnection(accountId);
+    response.json({ disconnected: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to disconnect Xero.";
+    response.status(500).json({ message });
+  }
+});
+
+app.post("/xero/publish-bill", upload.any(), async (request, response) => {
+  try {
+    const metadataFile = Array.isArray(request.files)
+      ? request.files.find((file) => file.fieldname === "metadata")
+      : null;
+    const metadataText = metadataFile?.buffer?.toString("utf8") || request.body?.metadata;
+    const metadata = parseJSONField(metadataText, {});
+    const accountId = String(
+      request.body?.accountId ||
+        metadata.accountId ||
+        metadata.accountID ||
+        ""
+    ).trim();
+
+    if (!accountId) {
+      response.status(400).json({ message: "Missing accountId." });
+      return;
+    }
+
+    const documentFiles = (Array.isArray(request.files) ? request.files : []).filter(
+      (file) => file.fieldname === "documents[]"
+    );
+    const result = await createXeroBill(accountId, metadata, documentFiles);
+    response.json({
+      submissionId: metadata.submissionId || result.remoteSubmissionID,
+      remoteSubmissionID: result.remoteSubmissionID,
+      message: result.confirmationMessage,
+      tenantName: (await getXeroConnection(accountId))?.selectedTenantName || null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to publish bill to Xero.";
+    response.status(500).json({ message });
+  }
 });
 
 app.post(
@@ -261,64 +977,37 @@ app.post(
 
       const metadata = JSON.parse(metadataText);
       const documentFiles = files.filter((file) => file.fieldname === "documents[]");
-
-      const to = String(metadata.deliveryTo || "");
-      const from = String(
-        process.env.GMAIL_SENDER_EMAIL ||
-          process.env.JENTRY_BACKEND_SENDER_EMAIL ||
-          "theteam@jaccountancy.co.uk"
-      );
-      const subject = String(metadata.deliverySubject || "Jentry submission");
-      const body = String(metadata.deliveryBody || "");
+      const routingMethod = String(metadata.routingMethod || "xeroFilesEmail").trim();
 
       console.log("Upload parsed.", {
         submissionId: metadata.submissionId || "missing",
-        to,
-        from,
+        routingMethod,
         documentCount: documentFiles.length
       });
 
-      if (!to) {
-        console.error("Upload rejected: deliveryTo missing.", {
-          submissionId: metadata.submissionId || "missing"
+      let result;
+      if (routingMethod === "xeroIntegration") {
+        const accountId = String(metadata.accountId || metadata.accountID || "").trim();
+        if (!accountId) {
+          throw new Error("Missing accountId for Xero-integrated submission.");
+        }
+        result = await createXeroBill(accountId, metadata, documentFiles);
+        response.json({
+          submissionId: metadata.submissionId || result.remoteSubmissionID,
+          message: result.confirmationMessage,
+          remoteSubmissionID: result.remoteSubmissionID
         });
-        response.status(400).json({ message: "Missing deliveryTo in metadata." });
         return;
       }
 
-      if (documentFiles.length === 0) {
-        console.error("Upload rejected: no documents attached.", {
-          submissionId: metadata.submissionId || "missing"
-        });
-        response.status(400).json({ message: "No documents were uploaded." });
-        return;
-      }
-
-      const attachments = documentFiles.map((file) => ({
-        filename: file.originalname,
-        mimeType: file.mimetype || "application/octet-stream",
-        data: file.buffer
-      }));
-
-      const sendResult = await sendEmail({
-        to,
-        from,
-        subject,
-        body,
-        attachments
-      });
-
+      result = await handleEmailUpload(metadata, documentFiles);
       console.log("Email sent successfully.", {
-        submissionId: metadata.submissionId || sendResult.data.id,
-        gmailMessageId: sendResult.data.id,
-        to,
+        submissionId: result.submissionId,
+        routingMethod,
         documentCount: documentFiles.length
       });
 
-      response.json({
-        submissionId: metadata.submissionId || sendResult.data.id,
-        message: `Submission emailed to ${to} from ${from}.`
-      });
+      response.json(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown server error.";
       console.error("Upload processing failed.", {
@@ -423,11 +1112,7 @@ app.post(
         }));
 
       const to = String(metadata.to || "jay@jaccountancy.co.uk");
-      const from = String(
-        process.env.GMAIL_SENDER_EMAIL ||
-          process.env.JENTRY_BACKEND_SENDER_EMAIL ||
-          "theteam@jaccountancy.co.uk"
-      );
+      const from = String(getSenderEmail());
       const subject = String(metadata.subject || "Jentry problem report");
       const body = String(metadata.body || "");
 
@@ -470,10 +1155,17 @@ app.listen(port, () => {
     safeJSONString({
       routes: [
         "GET /health",
+        "GET /oauth/xero/start",
+        "GET /oauth/xero/callback",
+        "GET /xero/status",
+        "GET /xero/tenants",
+        "POST /xero/select-tenant",
+        "POST /xero/disconnect",
+        "POST /xero/publish-bill",
         "POST /jentry/uploads",
         "POST /analyze",
         "POST /problem-report"
       ]
     })
   );
-}); 
+});
