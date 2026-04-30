@@ -1446,7 +1446,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                             type: "array",
                             items: {
                                 type: "object",
-                                additionalProperties: true,
+                                additionalProperties: false,
                                 properties: {
                                     name: { type: "string" },
                                     quantity: { type: ["string", "null"] },
