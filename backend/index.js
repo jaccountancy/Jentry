@@ -920,7 +920,9 @@ app.post("/xero/disconnect", async (request, response) => {
     response.status(500).json({ message });
   }
 });
-
+app.get("/debug-jentry", (_request, response) => {
+  response.json({ marker: "xero-routes-live-2026-04-30" });
+});
 app.post("/xero/publish-bill", upload.any(), async (request, response) => {
   try {
     const metadataFile = Array.isArray(request.files)
