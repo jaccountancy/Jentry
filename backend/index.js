@@ -745,7 +745,7 @@ function xeroScopes() {
 }
 
 function xeroConfigured() {
-    return Boolean(xeroClientID() && xeroRedirectURI());
+    return Boolean(xeroClientID() && xeroClientSecret() && xeroRedirectURI());
 }
 
 function toBase64Url(value) {
