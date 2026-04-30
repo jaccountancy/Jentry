@@ -675,6 +675,10 @@ function xeroClientID() {
     return normalizeOptionalString(process.env.XERO_CLIENT_ID);
 }
 
+function xeroClientSecret() {
+    return normalizeOptionalString(process.env.XERO_CLIENT_SECRET);
+}
+
 function normalizeAbsoluteURL(value) {
     const rawValue = normalizeOptionalString(value);
     if (!rawValue) {
