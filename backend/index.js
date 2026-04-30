@@ -1,5 +1,4 @@
 import crypto from "crypto";
-import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -8,6 +7,7 @@ import express from "express";
 import { google } from "googleapis";
 import MailComposer from "mailcomposer";
 import multer from "multer";
+import { Pool } from "pg";
 import sharp from "sharp";
 
 dotenv.config();
@@ -66,10 +66,12 @@ const XERO_CONNECTIONS_URL = "https://api.xero.com/connections";
 const XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices";
 const XERO_ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts";
 const XERO_BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions";
-
 const xeroAuthSessions = new Map();
-const dataDirectory = path.join(__dirname, "data");
-const xeroConnectionsPath = path.join(dataDirectory, "xero-connections.json");
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
 
 app.get("/health", (_request, response) => {
     console.log("Health check received.");
