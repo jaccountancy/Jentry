@@ -253,7 +253,6 @@ app.get("/xero/status", async (request, response) => {
         });
     }
 });
-
 app.get("/xero/tenants", async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
@@ -507,6 +506,56 @@ for (const reportPath of ["/problem-report", "/jentry/problem-report"]) {
     );
 }
 
+app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, response) => {
+    try {
+        const payload = request.body || {};
+
+        const recipient = extractPrimaryRecipient(payload);
+        const inboxEmail = normalizeEmail(recipient);
+        if (!inboxEmail) {
+            response.status(400).json({ message: "Missing inbound recipient." });
+            return;
+        }
+
+        const accountId = await resolveAccountIdFromInboundAddress(inboxEmail);
+        if (!accountId) {
+            response.status(404).json({ message: "No Jentry account matched this inbox address." });
+            return;
+        }
+
+        const attachments = normalizePostmarkAttachments(payload.Attachments);
+        if (attachments.length === 0) {
+            response.status(200).json({ ok: true, ignored: true, reason: "No supported attachments." });
+            return;
+        }
+
+        const submission = await createInboundEmailSubmission({
+            accountId,
+            inboxEmail,
+            payload
+        });
+
+        response.status(200).json({
+            ok: true,
+            submissionId: submission.id,
+            accountId
+        });
+
+        queueInboundEmailProcessing(submission, attachments).catch((error) => {
+            console.error("Inbound email processing failed.", {
+                submissionId: submission.id,
+                message: error instanceof Error ? error.message : String(error)
+            });
+        });
+    } catch (error) {
+        console.error("Postmark inbound webhook failed.", {
+            message: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined
+        });
+        response.status(500).json({ message: "Inbound processing failed." });
+    }
+});
+
 app.use((request, response) => {
     response.status(404).send(`Cannot ${request.method} ${request.path}`);
 });
@@ -529,11 +578,11 @@ app.listen(port, () => {
             "POST /analyze",
             "POST /jentry/analyze",
             "POST /problem-report",
-            "POST /jentry/problem-report"
+            "POST /jentry/problem-report",
+            "POST /inbound/postmark"
         ]
     }));
 });
-
 async function analyzeHandler(request, response) {
     try {
         if (!optionalEnvironmentVariables.openAIAPIKey) {
@@ -548,11 +597,6 @@ async function analyzeHandler(request, response) {
         }
 
         const capturedAt = normalizeOptionalString(request.body?.capturedAt);
-        console.log("Receipt analysis request received.", {
-            contentType: request.headers["content-type"] || "unknown",
-            mimeType: documentFile.mimetype || "unknown",
-            size: documentFile.size || documentFile.buffer.length
-        });
 
         const extraction = await analyzeReceiptWithOpenAI({
             buffer: documentFile.buffer,
@@ -560,19 +604,9 @@ async function analyzeHandler(request, response) {
             capturedAt
         });
 
-        console.log("Receipt analysis completed.", {
-            merchant: extraction.merchant || "unknown",
-            totalText: extraction.totalText || "unknown",
-            needsReview: extraction.needsReview
-        });
-
         response.json(extraction);
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown analysis error.";
-        console.error("Receipt analysis failed.", {
-            message,
-            stack: error instanceof Error ? error.stack : undefined
-        });
         response.status(500).json({ message });
     }
 }
@@ -581,16 +615,19 @@ async function problemReportHandler(request, response) {
     try {
         const metadataFile = request.files?.metadata?.[0];
         const metadataText = metadataFile?.buffer.toString("utf8") || request.body?.metadata;
+
         if (!metadataText) {
             response.status(400).json({ message: "Missing problem report metadata." });
             return;
         }
 
         const metadata = JSON.parse(metadataText);
+
         const to = normalizeEmail(metadata.to) || "jay@jaccountancy.co.uk";
         const from = normalizeEmail(process.env.GMAIL_SENDER);
         const subject = normalizeOptionalString(metadata.subject) || "Jentry problem report";
         const body = normalizeOptionalString(metadata.body) || "A problem report was sent from Jentry.";
+
         const attachments = request.files?.["attachments[]"] ?? [];
 
         const rawMessage = await buildRawMessage({
@@ -607,15 +644,7 @@ async function problemReportHandler(request, response) {
 
         const sendResult = await gmail.users.messages.send({
             userId: "me",
-            requestBody: {
-                raw: rawMessage
-            }
-        });
-
-        console.log("Problem report emailed successfully.", {
-            reportID: sendResult.data.id,
-            to,
-            attachmentCount: attachments.length
+            requestBody: { raw: rawMessage }
         });
 
         response.json({
@@ -624,13 +653,157 @@ async function problemReportHandler(request, response) {
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown problem report error.";
-        console.error("Problem report failed.", {
-            message,
-            stack: error instanceof Error ? error.stack : undefined
-        });
         response.status(500).json({ message });
     }
 }
+
+
+// =========================
+// POSTMARK + DB
+// =========================
+
+async function ensureJentryAccountsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS jentry_accounts (
+            account_id text PRIMARY KEY,
+            client_id text,
+            company_name text,
+            jentry_inbox_email text UNIQUE,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+}
+
+async function resolveAccountIdFromInboundAddress(email) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return null;
+
+    await ensureJentryAccountsTable();
+
+    const result = await pool.query(
+        `SELECT account_id FROM jentry_accounts WHERE LOWER(jentry_inbox_email) = LOWER($1) LIMIT 1`,
+        [normalizedEmail]
+    );
+
+    return result.rows[0]?.account_id || null;
+}
+
+async function ensureInboundEmailSubmissionsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS inbound_email_submissions (
+            id text PRIMARY KEY,
+            account_id text NOT NULL,
+            inbox_email text NOT NULL,
+            sender_email text,
+            subject text,
+            raw_payload jsonb NOT NULL,
+            status text NOT NULL DEFAULT 'received',
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+}
+
+async function createInboundEmailSubmission({ accountId, inboxEmail, payload }) {
+    await ensureInboundEmailSubmissionsTable();
+
+    const id = crypto.randomUUID();
+
+    await pool.query(
+        `
+        INSERT INTO inbound_email_submissions (
+            id, account_id, inbox_email, sender_email, subject, raw_payload, status
+        ) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+        `,
+        [
+            id,
+            accountId,
+            inboxEmail,
+            normalizeOptionalString(payload?.FromFull?.Email || payload?.From),
+            normalizeOptionalString(payload?.Subject),
+            JSON.stringify(payload),
+            "received"
+        ]
+    );
+
+    return { id, accountId };
+}
+
+async function queueInboundEmailProcessing(submission, attachments = []) {
+    setImmediate(async () => {
+        try {
+            console.log("Processing inbound email", {
+                submissionId: submission.id,
+                attachmentCount: attachments.length
+            });
+
+            // future: AI + Xero logic here
+
+            await pool.query(
+                `UPDATE inbound_email_submissions SET status = 'processed' WHERE id = $1`,
+                [submission.id]
+            );
+        } catch (error) {
+            await pool.query(
+                `UPDATE inbound_email_submissions SET status = 'failed' WHERE id = $1`,
+                [submission.id]
+            );
+        }
+    });
+}
+
+
+// =========================
+// POSTMARK HELPERS
+// =========================
+
+function extractPrimaryRecipient(payload) {
+    const to =
+        normalizeOptionalString(payload?.ToFull?.[0]?.Email) ||
+        normalizeOptionalString(payload?.OriginalRecipient) ||
+        normalizeOptionalString(payload?.To);
+
+    if (!to) return "";
+
+    const match = to.match(/<([^>]+)>/);
+    return normalizeEmail(match ? match[1] : to);
+}
+
+function normalizePostmarkAttachments(attachments) {
+    if (!Array.isArray(attachments)) return [];
+
+    return attachments
+        .map((attachment) => {
+            const filename = normalizeOptionalString(attachment?.Name);
+            const contentType = normalizeOptionalString(attachment?.ContentType) || "application/octet-stream";
+            const content = normalizeOptionalString(attachment?.Content);
+
+            if (!filename || !content) return null;
+
+            const lower = filename.toLowerCase();
+
+            const supported =
+                contentType === "application/pdf" ||
+                contentType.startsWith("image/") ||
+                lower.endsWith(".pdf") ||
+                lower.endsWith(".jpg") ||
+                lower.endsWith(".jpeg") ||
+                lower.endsWith(".png") ||
+                lower.endsWith(".heic");
+
+            if (!supported) return null;
+
+            return {
+                originalname: filename,
+                mimetype: contentType,
+                buffer: Buffer.from(content, "base64"),
+                size: Buffer.byteLength(content, "base64")
+            };
+        })
+        .filter(Boolean);
+}
+// =========================
+// GENERAL HELPERS
+// =========================
 
 function normalizeEmail(value) {
     if (typeof value !== "string") {
@@ -684,29 +857,25 @@ function xeroClientSecret() {
 
 function normalizeAbsoluteURL(value) {
     const rawValue = normalizeOptionalString(value);
-    if (!rawValue) {
-        return null;
-    }
+    if (!rawValue) return null;
 
     try {
         return new URL(rawValue).toString();
-    } catch (_error) {
+    } catch {
         return null;
     }
 }
 
 function normalizeWebURL(value) {
     const absoluteURL = normalizeAbsoluteURL(value);
-    if (!absoluteURL) {
-        return null;
-    }
+    if (!absoluteURL) return null;
 
     try {
         const parsedURL = new URL(absoluteURL);
         return parsedURL.protocol === "http:" || parsedURL.protocol === "https:"
             ? parsedURL.toString()
             : null;
-    } catch (_error) {
+    } catch {
         return null;
     }
 }
@@ -715,9 +884,7 @@ function xeroRedirectURI() {
     const fallbackURL = "https://jentry-jentry.up.railway.app/oauth/xero/callback";
     const configuredURL = normalizeWebURL(process.env.XERO_REDIRECT_URI);
 
-    if (configuredURL) {
-        return configuredURL;
-    }
+    if (configuredURL) return configuredURL;
 
     const rawConfiguredURL = normalizeOptionalString(process.env.XERO_REDIRECT_URI);
     if (rawConfiguredURL) {
@@ -738,6 +905,7 @@ function xeroAppRedirectURI() {
 function xeroScopes() {
     const rawScopes = normalizeOptionalString(process.env.XERO_SCOPES)
         || "openid profile email offline_access accounting.transactions accounting.contacts accounting.settings";
+
     return rawScopes
         .split(/\s+/)
         .filter(Boolean)
@@ -750,6 +918,7 @@ function xeroConfigured() {
 
 function toBase64Url(value) {
     const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+
     return buffer
         .toString("base64")
         .replace(/\+/g, "-")
@@ -765,13 +934,20 @@ function createPKCEPair() {
 
 function buildReturnURL(baseURL, params) {
     const target = new URL(baseURL);
+
     Object.entries(params).forEach(([key, value]) => {
         if (value != null && value !== "") {
             target.searchParams.set(key, String(value));
         }
     });
+
     return target.toString();
 }
+
+
+// =========================
+// XERO DB HELPERS
+// =========================
 
 async function ensureXeroConnectionsTable() {
     await pool.query(`
@@ -785,9 +961,7 @@ async function ensureXeroConnectionsTable() {
 
 async function getXeroConnection(accountId) {
     const normalizedAccountId = normalizeOptionalString(accountId);
-    if (!normalizedAccountId) {
-        return null;
-    }
+    if (!normalizedAccountId) return null;
 
     await ensureXeroConnectionsTable();
 
@@ -825,9 +999,7 @@ async function upsertXeroConnection(accountId, updater) {
 
 async function deleteXeroConnection(accountId) {
     const normalizedAccountId = normalizeOptionalString(accountId);
-    if (!normalizedAccountId) {
-        return;
-    }
+    if (!normalizedAccountId) return;
 
     await ensureXeroConnectionsTable();
 
@@ -837,8 +1009,14 @@ async function deleteXeroConnection(accountId) {
     );
 }
 
+
+// =========================
+// XERO API HELPERS
+// =========================
+
 async function exchangeXeroToken(params) {
     const body = new URLSearchParams(params);
+
     const response = await fetch(XERO_TOKEN_URL, {
         method: "POST",
         headers: {
@@ -848,6 +1026,7 @@ async function exchangeXeroToken(params) {
     });
 
     const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
         throw new Error(data.error_description || data.error || "Xero token exchange failed.");
     }
@@ -864,6 +1043,7 @@ async function fetchXeroTenants(accessToken) {
     });
 
     const data = await response.json().catch(() => []);
+
     if (!response.ok) {
         throw new Error("Failed to fetch Xero organisations.");
     }
@@ -872,9 +1052,7 @@ async function fetchXeroTenants(accessToken) {
 }
 
 function sanitizeTenants(connections) {
-    if (!Array.isArray(connections)) {
-        return [];
-    }
+    if (!Array.isArray(connections)) return [];
 
     return connections
         .map((connection) => ({
@@ -898,11 +1076,13 @@ async function fetchChartOfAccounts(accessToken, tenantId) {
     });
 
     const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
         throw new Error(data?.Message || "Failed to fetch Xero chart of accounts.");
     }
 
     const accounts = Array.isArray(data?.Accounts) ? data.Accounts : [];
+
     return accounts
         .map((account) => ({
             code: normalizeOptionalString(account.Code),
@@ -917,15 +1097,14 @@ async function fetchChartOfAccounts(accessToken, tenantId) {
 }
 
 function tokenExpiresSoon(expiresAt) {
-    if (!expiresAt) {
-        return true;
-    }
+    if (!expiresAt) return true;
 
     return new Date(expiresAt).getTime() - Date.now() < 120000;
 }
 
 async function ensureFreshXeroConnection(accountId) {
     const connection = await getXeroConnection(accountId);
+
     if (!connection) {
         throw new Error("No Xero connection found for this account.");
     }
@@ -938,19 +1117,22 @@ async function ensureFreshXeroConnection(accountId) {
         throw new Error("Xero connection cannot be refreshed.");
     }
 
-const tokenData = await exchangeXeroToken({
-    grant_type: "refresh_token",
-    client_id: xeroClientID(),
-    client_secret: xeroClientSecret(),
-    refresh_token: connection.refreshToken
-});
+    const tokenData = await exchangeXeroToken({
+        grant_type: "refresh_token",
+        client_id: xeroClientID(),
+        client_secret: xeroClientSecret(),
+        refresh_token: connection.refreshToken
+    });
 
     const tenants = await fetchXeroTenants(tokenData.access_token);
+
     return upsertXeroConnection(accountId, async (previous) => {
         const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
         const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
+
         const chartOfAccounts = selectedTenant
-            ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId).catch(() => previous?.chartOfAccounts || [])
+            ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
+                .catch(() => previous?.chartOfAccounts || [])
             : previous?.chartOfAccounts || [];
 
         return {
@@ -966,7 +1148,9 @@ const tokenData = await exchangeXeroToken({
             selectedTenantId: selectedTenant?.tenantId || null,
             selectedTenantName: selectedTenant?.tenantName || null,
             chartOfAccounts,
-            chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0 ? new Date().toISOString() : (previous?.chartOfAccountsLastSyncedAt || null)
+            chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
+                ? new Date().toISOString()
+                : previous?.chartOfAccountsLastSyncedAt || null
         };
     });
 }
@@ -979,12 +1163,20 @@ async function xeroGetJSON(url, { accessToken, tenantId }) {
             Accept: "application/json"
         }
     });
+
     const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
         throw new Error(data?.Message || "Xero request failed.");
     }
+
     return data;
 }
+
+
+// =========================
+// XERO MATCHING
+// =========================
 
 async function findMatchingXeroTransactions({ accessToken, tenantId, document }) {
     const merchant = normalizeOptionalString(document.merchant);
@@ -1097,7 +1289,8 @@ function buildMatchSummary(candidate, score) {
         candidate.date || null,
         `match score ${score}`
     ].filter(Boolean);
-    return fragments.join(" â€¢ ");
+
+    return fragments.join(" • ");
 }
 
 function normalizeComparableText(value) {
@@ -1109,6 +1302,7 @@ function normalizeComparableText(value) {
 function parseAmountText(value) {
     const normalized = normalizeOptionalString(value).replace(/[^0-9.-]/g, "");
     const parsed = Number(normalized);
+
     return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -1117,12 +1311,11 @@ function coerceNumber(value) {
 }
 
 function dayDistance(lhs, rhs) {
-    if (!lhs || !rhs) {
-        return null;
-    }
+    if (!lhs || !rhs) return null;
 
     const lhsDate = new Date(lhs);
     const rhsDate = new Date(rhs);
+
     if (Number.isNaN(lhsDate.getTime()) || Number.isNaN(rhsDate.getTime())) {
         return null;
     }
@@ -1137,13 +1330,20 @@ function formatCurrency(value) {
     }).format(value);
 }
 
+
+// =========================
+// XERO BILL / INVOICE CREATION
+// =========================
+
 function pickDocumentDate(extractedDocuments) {
     const candidates = Array.isArray(extractedDocuments) ? extractedDocuments : [];
+
     for (const document of candidates) {
         if (typeof document?.dateISO === "string" && document.dateISO.trim()) {
             return document.dateISO.trim().slice(0, 10);
         }
     }
+
     return new Date().toISOString().slice(0, 10);
 }
 
@@ -1151,19 +1351,29 @@ function buildBillLineItems(metadata) {
     const extractedDocuments = Array.isArray(metadata.extractedDocuments)
         ? metadata.extractedDocuments
         : [];
-    const chartOfAccounts = Array.isArray(metadata.chartOfAccounts) ? metadata.chartOfAccounts : [];
+
+    const chartOfAccounts = Array.isArray(metadata.chartOfAccounts)
+        ? metadata.chartOfAccounts
+        : [];
 
     const lineItems = [];
+
     for (const document of extractedDocuments) {
         const documentLineItems = Array.isArray(document?.lineItems) ? document.lineItems : [];
         const lineItemCode = normalizeOptionalString(document?.nominalCode || document?.accountCode);
         const fallbackTaxType = normalizeOptionalString(document?.taxType);
+
         if (documentLineItems.length > 0) {
             for (const item of documentLineItems) {
                 const rawAmount = normalizeOptionalString(item?.amountText).replace(/[^0-9.-]/g, "");
                 const parsedAmount = Number(rawAmount);
                 const code = normalizeOptionalString(item?.nominalCode || lineItemCode);
-                const taxType = normalizeOptionalString(item?.taxType || fallbackTaxType || inferTaxTypeFromDocument(document, chartOfAccounts, code));
+                const taxType = normalizeOptionalString(
+                    item?.taxType ||
+                    fallbackTaxType ||
+                    inferTaxTypeFromDocument(document, chartOfAccounts, code)
+                );
+
                 lineItems.push(compactObject({
                     Description: String(item?.name || "Receipt line item").slice(0, 4000),
                     Quantity: Number(normalizeOptionalString(item?.quantity).replace(/[^0-9.-]/g, "")) || 1,
@@ -1179,9 +1389,14 @@ function buildBillLineItems(metadata) {
                 document?.merchant ||
                 "Receipt"
             ).trim();
+
             const parsedTotal = Number(document?.totalAmount);
             const code = lineItemCode;
-            const taxType = normalizeOptionalString(document?.taxType || inferTaxTypeFromDocument(document, chartOfAccounts, code));
+            const taxType = normalizeOptionalString(
+                document?.taxType ||
+                inferTaxTypeFromDocument(document, chartOfAccounts, code)
+            );
+
             lineItems.push(compactObject({
                 Description: description.slice(0, 4000),
                 Quantity: 1,
@@ -1198,6 +1413,7 @@ function buildBillLineItems(metadata) {
 
     const descriptions = Array.isArray(metadata.descriptions) ? metadata.descriptions : [];
     const fallbackDescription = descriptions.join(", ").slice(0, 4000) || "Jentry document submission";
+
     return [
         {
             Description: fallbackDescription,
@@ -1211,28 +1427,32 @@ function inferTaxTypeFromDocument(document, chartOfAccounts, accountCode) {
         return "INPUT";
     }
 
-    if (!accountCode) {
-        return "";
-    }
+    if (!accountCode) return "";
 
     const matchedAccount = chartOfAccounts.find((account) => account.code === accountCode);
     return matchedAccount?.taxType || "";
 }
 
 function compactObject(value) {
-    return Object.fromEntries(Object.entries(value).filter(([, candidate]) => candidate !== undefined && candidate !== ""));
+    return Object.fromEntries(
+        Object.entries(value).filter(([, candidate]) => candidate !== undefined && candidate !== "")
+    );
 }
 
 function buildXeroDocumentPayload(metadata) {
     const extractedDocuments = Array.isArray(metadata.extractedDocuments)
         ? metadata.extractedDocuments
         : [];
+
     const primaryDocument = extractedDocuments[0] || {};
     const documentType = normalizeOptionalString(metadata.documentType) === "sales"
         ? "sales"
         : "purchase";
+
     const contactName = normalizeOptionalString(primaryDocument.merchant)
-        || `${normalizeOptionalString(metadata.companyName) || "Jentry"} ${documentType === "sales" ? "customer" : "supplier"}`;
+        || `${normalizeOptionalString(metadata.companyName) || "Jentry"} ${
+            documentType === "sales" ? "customer" : "supplier"
+        }`;
 
     const referenceBase = normalizeOptionalString(primaryDocument.invoiceNumber)
         || normalizeOptionalString(metadata.submissionId)
@@ -1259,6 +1479,7 @@ function buildXeroDocumentPayload(metadata) {
 
 async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }) {
     const attachmentURL = `${XERO_INVOICES_URL}/${invoiceId}/Attachments/${encodeURIComponent(file.originalname)}`;
+
     const response = await fetch(attachmentURL, {
         method: "PUT",
         headers: {
@@ -1280,6 +1501,7 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
 
 async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
     const connection = await ensureFreshXeroConnection(accountId);
+
     if (!connection.selectedTenantId) {
         throw new Error("No Xero organisation has been selected for this account.");
     }
@@ -1288,10 +1510,12 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         ...metadata,
         chartOfAccounts: connection.chartOfAccounts || []
     };
+
     const xeroPayload = buildXeroDocumentPayload(metadataWithAccounts);
     const documentType = normalizeOptionalString(metadata.documentType) === "sales"
         ? "sales"
         : "purchase";
+
     const response = await fetch(XERO_INVOICES_URL, {
         method: "POST",
         headers: {
@@ -1306,14 +1530,17 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
     });
 
     const data = await response.json().catch(() => ({}));
+
     if (!response.ok) {
         const details = data?.Elements?.[0]?.ValidationErrors?.map((entry) => entry.Message).join("; ")
             || data?.Message
             || `Xero ${documentType} creation failed.`;
+
         throw new Error(details);
     }
 
     const invoice = data?.Invoices?.[0];
+
     if (!invoice?.InvoiceID) {
         throw new Error("Xero did not return an invoice ID.");
     }
@@ -1333,6 +1560,11 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         invoice
     };
 }
+
+
+// =========================
+// EMAIL + OPENAI
+// =========================
 
 async function handleEmailUpload(metadata, documentFiles) {
     const to = normalizeEmail(metadata.deliveryTo);
@@ -1375,6 +1607,7 @@ async function handleEmailUpload(metadata, documentFiles) {
 
 async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
     const { originalImageDataURL, enhancedImageDataURL } = await buildReceiptAnalysisImages({ buffer, mimeType });
+
     const body = {
         model: optionalEnvironmentVariables.openAIModel,
         input: [
@@ -1394,7 +1627,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern 'Â£11.58 â€“ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses as the vendor.",
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses as the vendor.",
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or invoice details visible."
                         ].join(" ")
                     }
@@ -1512,6 +1745,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
     });
 
     const rawResponse = await apiResponse.text();
+
     if (!apiResponse.ok) {
         throw new Error(`OpenAI extraction failed: ${rawResponse}`);
     }
@@ -1526,6 +1760,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
     }
 
     const extraction = JSON.parse(outputText);
+
     return {
         recognizedText: normalizeOptionalString(extraction.recognizedText),
         merchant: normalizeOptionalString(extraction.merchant) || null,
@@ -1611,7 +1846,10 @@ function extractOutputText(parsedResponse) {
         }
 
         for (const contentItem of item.content) {
-            if ((contentItem.type === "output_text" || contentItem.type === "text") && typeof contentItem.text === "string") {
+            if (
+                (contentItem.type === "output_text" || contentItem.type === "text") &&
+                typeof contentItem.text === "string"
+            ) {
                 return contentItem.text;
             }
         }
