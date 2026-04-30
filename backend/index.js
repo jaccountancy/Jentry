@@ -687,6 +687,11 @@ app.get("/health", (_request, response) => {
 
 app.get("/oauth/xero/start", async (request, response) => {
   try {
+    console.log("Xero start route hit.", {
+      accountId: String(request.query.accountId || "").trim(),
+      returnUri: String(request.query.returnUri || xeroAppRedirectURI()).trim()
+    });
+
     if (!xeroConfigured()) {
       response.status(500).json({ message: "Xero OAuth is not configured on the backend." });
       return;
@@ -730,6 +735,13 @@ app.get("/oauth/xero/callback", async (request, response) => {
   const authSession = xeroAuthSessions.get(state);
   const fallbackReturnURL = authSession?.returnUri || xeroAppRedirectURI();
 
+  console.log("Xero callback route hit.", {
+    state,
+    hasSession: Boolean(authSession),
+    codePresent: Boolean(String(request.query.code || "").trim()),
+    error: String(request.query.error || "").trim() || null
+  });
+
   try {
     if (!authSession) {
       response.redirect(
@@ -767,6 +779,10 @@ app.get("/oauth/xero/callback", async (request, response) => {
       return;
     }
 
+    console.log("Exchanging Xero authorization code for tokens.", {
+      accountId: authSession.accountId
+    });
+
     const tokenData = await exchangeXeroToken({
       grant_type: "authorization_code",
       client_id: xeroClientID(),
@@ -776,6 +792,12 @@ app.get("/oauth/xero/callback", async (request, response) => {
     });
 
     const tenants = await fetchXeroTenants(tokenData.access_token);
+
+    console.log("Fetched Xero tenants.", {
+      accountId: authSession.accountId,
+      tenantCount: tenants.length
+    });
+
     const selectedTenant = tenants[0] || null;
 
     await upsertXeroConnection(authSession.accountId, () => ({
@@ -792,6 +814,11 @@ app.get("/oauth/xero/callback", async (request, response) => {
       selectedTenantName: selectedTenant?.tenantName || null
     }));
 
+    console.log("Redirecting back to app after successful Xero connection.", {
+      accountId: authSession.accountId,
+      returnUri: authSession.returnUri
+    });
+
     response.redirect(
       buildReturnURL(authSession.returnUri, {
         accountId: authSession.accountId,
@@ -800,6 +827,12 @@ app.get("/oauth/xero/callback", async (request, response) => {
       })
     );
   } catch (error) {
+    console.error("Xero callback failed.", {
+      accountId: authSession?.accountId || null,
+      message: error instanceof Error ? error.message : "Xero connection failed.",
+      stack: error instanceof Error ? error.stack : undefined
+    });
+
     const message = error instanceof Error ? error.message : "Xero connection failed.";
     response.redirect(
       buildReturnURL(fallbackReturnURL, {
@@ -920,9 +953,7 @@ app.post("/xero/disconnect", async (request, response) => {
     response.status(500).json({ message });
   }
 });
-app.get("/debug-jentry", (_request, response) => {
-  response.json({ marker: "xero-routes-live-2026-04-30" });
-});
+
 app.post("/xero/publish-bill", upload.any(), async (request, response) => {
   try {
     const metadataFile = Array.isArray(request.files)
@@ -1147,6 +1178,10 @@ app.post(
   }
 );
 
+app.get("/debug-jentry", (_request, response) => {
+  response.json({ marker: "xero-routes-live-2026-04-30" });
+});
+
 app.use((request, response) => {
   response.status(404).send(`Cannot ${request.method} ${request.path}`);
 });
@@ -1166,7 +1201,8 @@ app.listen(port, () => {
         "POST /xero/publish-bill",
         "POST /jentry/uploads",
         "POST /analyze",
-        "POST /problem-report"
+        "POST /problem-report",
+        "GET /debug-jentry"
       ]
     })
   );
