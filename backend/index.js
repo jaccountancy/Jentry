@@ -169,6 +169,8 @@ app.get("/oauth/xero/callback", async (request, response) => {
             code_verifier: authSession.verifier
         });
 
+        const connectedUserEmail = extractConnectedUserEmail(tokenData.id_token);
+
         const tenants = await fetchXeroTenants(tokenData.access_token);
         const selectedTenant = tenants[0] || null;
         const chartOfAccounts = selectedTenant
@@ -180,6 +182,7 @@ app.get("/oauth/xero/callback", async (request, response) => {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token,
             idToken: tokenData.id_token || null,
+            connectedUserEmail,
             scope: tokenData.scope || xeroScopes(),
             expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
             connectedAt: new Date().toISOString(),
@@ -223,6 +226,7 @@ app.get("/xero/status", async (request, response) => {
             response.json({
                 isConnected: false,
                 requiresReconnect: false,
+                connectedUserEmail: null,
                 selectedTenantId: null,
                 selectedTenantName: null,
                 tenants: [],
@@ -236,6 +240,7 @@ app.get("/xero/status", async (request, response) => {
         response.json({
             isConnected: true,
             requiresReconnect: false,
+            connectedUserEmail: fresh.connectedUserEmail || null,
             selectedTenantId: fresh.selectedTenantId || null,
             selectedTenantName: fresh.selectedTenantName || null,
             tenants: fresh.tenants || [],
@@ -249,10 +254,12 @@ app.get("/xero/status", async (request, response) => {
         response.status(500).json({
             isConnected: false,
             requiresReconnect: true,
+            connectedUserEmail: null,
             message
         });
     }
 });
+
 app.get("/xero/tenants", async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
@@ -265,7 +272,8 @@ app.get("/xero/tenants", async (request, response) => {
         response.json({
             tenants: connection.tenants || [],
             selectedTenantId: connection.selectedTenantId || null,
-            selectedTenantName: connection.selectedTenantName || null
+            selectedTenantName: connection.selectedTenantName || null,
+            connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to load Xero organisations.";
@@ -301,6 +309,7 @@ app.post("/xero/select-tenant", async (request, response) => {
 
         response.json({
             isConnected: true,
+            connectedUserEmail: updated.connectedUserEmail || null,
             selectedTenantId: updated.selectedTenantId,
             selectedTenantName: updated.selectedTenantName,
             chartOfAccountsCount: updated.chartOfAccounts.length
@@ -320,7 +329,7 @@ app.post("/xero/disconnect", async (request, response) => {
         }
 
         await deleteXeroConnection(accountId);
-        response.json({ disconnected: true });
+        response.json({ disconnected: true, connectedUserEmail: null });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to disconnect Xero.";
         response.status(500).json({ message });
@@ -352,7 +361,8 @@ app.get("/xero/accounts", async (request, response) => {
         response.json({
             accounts: chartOfAccounts,
             syncedAt: new Date().toISOString(),
-            selectedTenantId: tenantId
+            selectedTenantId: tenantId,
+            connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to sync Xero chart of accounts.";
@@ -390,7 +400,8 @@ app.post("/xero/match-transactions", async (request, response) => {
         response.json({
             matches,
             selectedTenantId: connection.selectedTenantId,
-            selectedTenantName: connection.selectedTenantName || null
+            selectedTenantName: connection.selectedTenantName || null,
+            connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to match transactions in Xero.";
@@ -421,11 +432,14 @@ app.post("/xero/publish-bill", upload.any(), async (request, response) => {
         );
 
         const result = await createXeroLedgerDocument(accountId, metadata, documentFiles);
+        const connection = await getXeroConnection(accountId);
+
         response.json({
             submissionId: metadata.submissionId || result.remoteSubmissionID,
             remoteSubmissionID: result.remoteSubmissionID,
             message: result.confirmationMessage,
-            tenantName: (await getXeroConnection(accountId))?.selectedTenantName || null
+            tenantName: connection?.selectedTenantName || null,
+            connectedUserEmail: connection?.connectedUserEmail || null
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to publish bill to Xero.";
@@ -506,6 +520,123 @@ for (const reportPath of ["/problem-report", "/jentry/problem-report"]) {
     );
 }
 
+app.post("/jentry/inbox/register", async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.body?.accountId);
+        const clientId = normalizeOptionalString(request.body?.clientId);
+        const companyName = normalizeOptionalString(request.body?.companyName);
+        const inboxEmail = normalizeEmail(request.body?.inboxEmail);
+
+        if (!accountId || !inboxEmail) {
+            response.status(400).json({ message: "Missing accountId or inboxEmail." });
+            return;
+        }
+
+        await ensureJentryAccountsTable();
+
+        await pool.query(
+            `
+            INSERT INTO jentry_accounts (account_id, client_id, company_name, jentry_inbox_email)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (account_id)
+            DO UPDATE SET
+                client_id = EXCLUDED.client_id,
+                company_name = EXCLUDED.company_name,
+                jentry_inbox_email = EXCLUDED.jentry_inbox_email
+            `,
+            [accountId, clientId || null, companyName || null, inboxEmail]
+        );
+
+        response.json({ ok: true });
+    } catch (error) {
+        response.status(500).json({
+            message: error instanceof Error ? error.message : "Unable to register inbox."
+        });
+    }
+});
+
+app.get("/inbound-email-submissions", async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.query.accountId);
+        const inboxEmail = normalizeEmail(request.query.inboxEmail);
+        const clientId = normalizeOptionalString(request.query.clientId);
+
+        if (!accountId && !inboxEmail && !clientId) {
+            response.status(400).json({ message: "Missing accountId, inboxEmail, or clientId." });
+            return;
+        }
+
+        await ensureProcessedInboundSubmissionsTable();
+        await ensureJentryAccountsTable();
+
+        const conditions = [];
+        const values = [];
+
+        if (accountId) {
+            values.push(accountId);
+            conditions.push(`p.account_id = $${values.length}`);
+        }
+
+        if (inboxEmail) {
+            values.push(inboxEmail);
+            conditions.push(`LOWER(a.jentry_inbox_email) = LOWER($${values.length})`);
+        }
+
+        if (clientId) {
+            values.push(clientId);
+            conditions.push(`a.client_id = $${values.length}`);
+        }
+
+        const whereClause = conditions.length > 0
+            ? `WHERE ${conditions.join(" AND ")}`
+            : "";
+
+        const result = await pool.query(
+            `
+            SELECT 
+                p.id,
+                p.account_id,
+                p.title,
+                p.summary,
+                p.extracted_documents,
+                p.status,
+                p.created_at,
+                a.client_id,
+                a.company_name,
+                a.jentry_inbox_email
+            FROM processed_inbound_submissions p
+            LEFT JOIN jentry_accounts a
+                ON a.account_id = p.account_id
+            ${whereClause}
+            ORDER BY p.created_at DESC
+            LIMIT 100
+            `,
+            values
+        );
+
+        response.json({
+            submissions: result.rows.map((row) => ({
+                id: row.id,
+                accountId: row.account_id,
+                clientId: row.client_id || null,
+                companyName: row.company_name || null,
+                inboxEmail: row.jentry_inbox_email || null,
+                title: row.title,
+                summary: row.summary,
+                extractedDocuments: row.extracted_documents,
+                status: row.status,
+                createdAt: row.created_at
+            }))
+        });
+    } catch (error) {
+        response.status(500).json({
+            message: error instanceof Error
+                ? error.message
+                : "Unable to fetch inbound email submissions."
+        });
+    }
+});
+
 app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, response) => {
     try {
         const payload = request.body || {};
@@ -534,6 +665,8 @@ app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, r
             inboxEmail,
             payload
         });
+
+        await saveInboundEmailAttachments(submission.id, attachments);
 
         response.status(200).json({
             ok: true,
@@ -575,6 +708,8 @@ app.listen(port, () => {
             "POST /xero/match-transactions",
             "POST /xero/publish-bill",
             "POST /jentry/uploads",
+            "POST /jentry/inbox/register",
+            "GET /inbound-email-submissions",
             "POST /analyze",
             "POST /jentry/analyze",
             "POST /problem-report",
@@ -583,6 +718,7 @@ app.listen(port, () => {
         ]
     }));
 });
+
 async function analyzeHandler(request, response) {
     try {
         if (!optionalEnvironmentVariables.openAIAPIKey) {
@@ -656,8 +792,6 @@ async function problemReportHandler(request, response) {
         response.status(500).json({ message });
     }
 }
-
-
 // =========================
 // POSTMARK + DB
 // =========================
@@ -703,6 +837,33 @@ async function ensureInboundEmailSubmissionsTable() {
     `);
 }
 
+async function ensureInboundEmailAttachmentsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS inbound_email_attachments (
+            id text PRIMARY KEY,
+            submission_id text NOT NULL,
+            filename text NOT NULL,
+            content_type text,
+            file_data bytea NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+}
+
+async function ensureProcessedInboundSubmissionsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS processed_inbound_submissions (
+            id text PRIMARY KEY,
+            account_id text NOT NULL,
+            title text,
+            summary text,
+            extracted_documents jsonb NOT NULL,
+            status text NOT NULL DEFAULT 'ready',
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+}
+
 async function createInboundEmailSubmission({ accountId, inboxEmail, payload }) {
     await ensureInboundEmailSubmissionsTable();
 
@@ -728,29 +889,145 @@ async function createInboundEmailSubmission({ accountId, inboxEmail, payload }) 
     return { id, accountId };
 }
 
+async function saveInboundEmailAttachments(submissionId, attachments = []) {
+    await ensureInboundEmailAttachmentsTable();
+
+    for (const attachment of attachments) {
+        await pool.query(
+            `
+            INSERT INTO inbound_email_attachments (
+                id, submission_id, filename, content_type, file_data
+            ) VALUES ($1, $2, $3, $4, $5)
+            `,
+            [
+                crypto.randomUUID(),
+                submissionId,
+                attachment.originalname,
+                attachment.mimetype || null,
+                attachment.buffer
+            ]
+        );
+    }
+}
+
+async function loadInboundEmailAttachments(submissionId) {
+    await ensureInboundEmailAttachmentsTable();
+
+    const result = await pool.query(
+        `
+        SELECT id, filename, content_type, file_data
+        FROM inbound_email_attachments
+        WHERE submission_id = $1
+        ORDER BY created_at ASC
+        `,
+        [submissionId]
+    );
+
+    return result.rows.map((row) => ({
+        id: row.id,
+        originalname: row.filename,
+        mimetype: row.content_type || "application/octet-stream",
+        buffer: row.file_data
+    }));
+}
+
+async function createProcessedInboundSubmission({
+    submissionId,
+    accountId,
+    extractedDocuments = [],
+    attachments = []
+}) {
+    await ensureProcessedInboundSubmissionsTable();
+
+    const primary = extractedDocuments[0] || {};
+
+    const title =
+        normalizeOptionalString(primary.suggestedTitle) ||
+        normalizeOptionalString(primary.summary) ||
+        normalizeOptionalString(attachments[0]?.originalname) ||
+        "Email submission";
+
+    const summary =
+        normalizeOptionalString(primary.longDescription) ||
+        normalizeOptionalString(primary.shortDescription) ||
+        normalizeOptionalString(primary.summary) ||
+        "Processed from inbound email.";
+
+    await pool.query(
+        `
+        INSERT INTO processed_inbound_submissions (
+            id, account_id, title, summary, extracted_documents, status
+        ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+        ON CONFLICT (id)
+        DO UPDATE SET
+            account_id = EXCLUDED.account_id,
+            title = EXCLUDED.title,
+            summary = EXCLUDED.summary,
+            extracted_documents = EXCLUDED.extracted_documents,
+            status = EXCLUDED.status
+        `,
+        [
+            submissionId,
+            accountId,
+            title,
+            summary,
+            JSON.stringify(extractedDocuments),
+            "ready"
+        ]
+    );
+}
+
 async function queueInboundEmailProcessing(submission, attachments = []) {
     setImmediate(async () => {
         try {
-            console.log("Processing inbound email", {
-                submissionId: submission.id,
-                attachmentCount: attachments.length
-            });
+            if (!optionalEnvironmentVariables.openAIAPIKey) {
+                throw new Error("OpenAI receipt extraction is not configured.");
+            }
 
-            // future: AI + Xero logic here
+            const storedAttachments = attachments.length > 0
+                ? attachments
+                : await loadInboundEmailAttachments(submission.id);
+
+            const extractedDocuments = [];
+
+            for (const attachment of storedAttachments) {
+                const extraction = await analyzeReceiptWithOpenAI({
+                    buffer: attachment.buffer,
+                    mimeType: attachment.mimetype || "application/pdf",
+                    capturedAt: new Date().toISOString()
+                });
+
+                extractedDocuments.push({
+                    ...extraction,
+                    sourceFilename: attachment.originalname || null,
+                    sourceMimeType: attachment.mimetype || null
+                });
+            }
+
+            await createProcessedInboundSubmission({
+                submissionId: submission.id,
+                accountId: submission.accountId,
+                extractedDocuments,
+                attachments: storedAttachments
+            });
 
             await pool.query(
                 `UPDATE inbound_email_submissions SET status = 'processed' WHERE id = $1`,
                 [submission.id]
             );
         } catch (error) {
+            console.error("Inbound email processing failed.", {
+                submissionId: submission.id,
+                message: error instanceof Error ? error.message : String(error)
+            });
+
             await pool.query(
                 `UPDATE inbound_email_submissions SET status = 'failed' WHERE id = $1`,
                 [submission.id]
-            );
+            ).catch(() => undefined);
         }
     });
 }
-
 
 // =========================
 // POSTMARK HELPERS
@@ -801,16 +1078,47 @@ function normalizePostmarkAttachments(attachments) {
         })
         .filter(Boolean);
 }
+
 // =========================
 // GENERAL HELPERS
 // =========================
+
+function parseJWTPayload(token) {
+    const normalizedToken = normalizeOptionalString(token);
+    if (!normalizedToken) return null;
+
+    const parts = normalizedToken.split(".");
+    if (parts.length < 2) return null;
+
+    try {
+        const payload = parts[1]
+            .replace(/-/g, "+")
+            .replace(/_/g, "/");
+
+        const paddedPayload = payload + "=".repeat((4 - (payload.length % 4)) % 4);
+        return JSON.parse(Buffer.from(paddedPayload, "base64").toString("utf8"));
+    } catch {
+        return null;
+    }
+}
+
+function extractConnectedUserEmail(idToken, fallbackEmail = "") {
+    const claims = parseJWTPayload(idToken);
+
+    return normalizeOptionalString(
+        claims?.email ||
+        claims?.preferred_username ||
+        claims?.upn ||
+        fallbackEmail
+    ) || null;
+}
 
 function normalizeEmail(value) {
     if (typeof value !== "string") {
         return "";
     }
 
-    return value.trim();
+    return value.trim().toLowerCase();
 }
 
 function normalizeOptionalString(value) {
@@ -944,7 +1252,6 @@ function buildReturnURL(baseURL, params) {
     return target.toString();
 }
 
-
 // =========================
 // XERO DB HELPERS
 // =========================
@@ -1008,7 +1315,6 @@ async function deleteXeroConnection(accountId) {
         [normalizedAccountId]
     );
 }
-
 
 // =========================
 // XERO API HELPERS
@@ -1140,6 +1446,10 @@ async function ensureFreshXeroConnection(accountId) {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token,
             idToken: tokenData.id_token || null,
+            connectedUserEmail: extractConnectedUserEmail(
+                tokenData.id_token,
+                previous?.connectedUserEmail
+            ),
             scope: tokenData.scope || previous?.scope || xeroScopes(),
             expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
             connectedAt: previous?.connectedAt || new Date().toISOString(),
@@ -1172,7 +1482,6 @@ async function xeroGetJSON(url, { accessToken, tenantId }) {
 
     return data;
 }
-
 
 // =========================
 // XERO MATCHING
@@ -1329,7 +1638,6 @@ function formatCurrency(value) {
         currency: "GBP"
     }).format(value);
 }
-
 
 // =========================
 // XERO BILL / INVOICE CREATION
@@ -1561,7 +1869,6 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
     };
 }
 
-
 // =========================
 // EMAIL + OPENAI
 // =========================
@@ -1623,7 +1930,8 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                             "Focus on the single main receipt or invoice in the image, even if other documents are visible around it.",
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
-                            "You may receive both an original photo and a cleaned high-contrast enhancement of the same receipt. Use both together, but prefer the enhanced version for fine text and totals.",
+                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine text and totals.",
+                            "If a PDF is supplied, it has been converted to an image preview of its first page before analysis.",
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
@@ -1802,10 +2110,38 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
 }
 
 async function buildReceiptAnalysisImages({ buffer, mimeType }) {
-    const originalImageDataURL = `data:${mimeType};base64,${buffer.toString("base64")}`;
+    const normalizedMimeType = normalizeOptionalString(mimeType) || "image/jpeg";
+    const isPDF = normalizedMimeType === "application/pdf";
 
     try {
-        const enhancedBuffer = await sharp(buffer, { failOn: "none" })
+        const source = isPDF
+            ? await sharp(buffer, { density: 180, failOn: "none" })
+                .rotate()
+                .resize({
+                    width: 2200,
+                    height: 2200,
+                    fit: "inside",
+                    withoutEnlargement: true
+                })
+                .jpeg({ quality: 94, mozjpeg: true })
+                .toBuffer()
+            : buffer;
+
+        const originalImageDataURL = `data:image/jpeg;base64,${
+            await sharp(source, { failOn: "none" })
+                .rotate()
+                .resize({
+                    width: 2200,
+                    height: 2200,
+                    fit: "inside",
+                    withoutEnlargement: true
+                })
+                .jpeg({ quality: 94, mozjpeg: true })
+                .toBuffer()
+                .then((output) => output.toString("base64"))
+        }`;
+
+        const enhancedBuffer = await sharp(source, { failOn: "none" })
             .rotate()
             .resize({
                 width: 2200,
@@ -1828,10 +2164,15 @@ async function buildReceiptAnalysisImages({ buffer, mimeType }) {
             message: error instanceof Error ? error.message : String(error)
         });
 
-        return {
-            originalImageDataURL,
-            enhancedImageDataURL: originalImageDataURL
-        };
+        if (normalizedMimeType.startsWith("image/")) {
+            const originalImageDataURL = `data:${normalizedMimeType};base64,${buffer.toString("base64")}`;
+            return {
+                originalImageDataURL,
+                enhancedImageDataURL: originalImageDataURL
+            };
+        }
+
+        throw new Error("Unable to convert document into an image for analysis.");
     }
 }
 
