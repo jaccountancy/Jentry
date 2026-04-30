@@ -938,11 +938,12 @@ async function ensureFreshXeroConnection(accountId) {
         throw new Error("Xero connection cannot be refreshed.");
     }
 
-    const tokenData = await exchangeXeroToken({
-        grant_type: "refresh_token",
-        client_id: xeroClientID(),
-        refresh_token: connection.refreshToken
-    });
+const tokenData = await exchangeXeroToken({
+    grant_type: "refresh_token",
+    client_id: xeroClientID(),
+    client_secret: xeroClientSecret(),
+    refresh_token: connection.refreshToken
+});
 
     const tenants = await fetchXeroTenants(tokenData.access_token);
     return upsertXeroConnection(accountId, async (previous) => {
