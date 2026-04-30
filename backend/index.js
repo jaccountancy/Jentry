@@ -161,6 +161,7 @@ app.get("/oauth/xero/callback", async (request, response) => {
         const tokenData = await exchangeXeroToken({
             grant_type: "authorization_code",
             client_id: xeroClientID(),
+            client_secret: xeroClientSecret(),
             code,
             redirect_uri: xeroRedirectURI(),
             code_verifier: authSession.verifier
