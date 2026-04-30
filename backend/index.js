@@ -773,30 +773,14 @@ function buildReturnURL(baseURL, params) {
     return target.toString();
 }
 
-async function ensureDataDirectory() {
-    await fs.mkdir(dataDirectory, { recursive: true });
-}
-
-async function readXeroConnections() {
-    await ensureDataDirectory();
-    try {
-        const raw = await fs.readFile(xeroConnectionsPath, "utf8");
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed === "object" && parsed.accounts && typeof parsed.accounts === "object") {
-            return parsed;
-        }
-    } catch (error) {
-        if (error.code !== "ENOENT") {
-            console.warn("Failed to read Xero connection store.", error);
-        }
-    }
-
-    return { accounts: {} };
-}
-
-async function writeXeroConnections(store) {
-    await ensureDataDirectory();
-    await fs.writeFile(xeroConnectionsPath, JSON.stringify(store, null, 2));
+async function ensureXeroConnectionsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS xero_connections (
+            account_id text PRIMARY KEY,
+            payload jsonb NOT NULL,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
 }
 
 async function getXeroConnection(accountId) {
@@ -805,8 +789,14 @@ async function getXeroConnection(accountId) {
         return null;
     }
 
-    const store = await readXeroConnections();
-    return store.accounts[normalizedAccountId] || null;
+    await ensureXeroConnectionsTable();
+
+    const result = await pool.query(
+        `SELECT payload FROM xero_connections WHERE account_id = $1`,
+        [normalizedAccountId]
+    );
+
+    return result.rows[0]?.payload || null;
 }
 
 async function upsertXeroConnection(accountId, updater) {
@@ -815,19 +805,36 @@ async function upsertXeroConnection(accountId, updater) {
         throw new Error("Missing accountId.");
     }
 
-    const store = await readXeroConnections();
-    const previous = store.accounts[normalizedAccountId] || null;
+    const previous = await getXeroConnection(normalizedAccountId);
     const next = await updater(previous);
-    store.accounts[normalizedAccountId] = next;
-    await writeXeroConnections(store);
+
+    await ensureXeroConnectionsTable();
+
+    await pool.query(
+        `
+        INSERT INTO xero_connections (account_id, payload, updated_at)
+        VALUES ($1, $2::jsonb, now())
+        ON CONFLICT (account_id)
+        DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+        `,
+        [normalizedAccountId, JSON.stringify(next)]
+    );
+
     return next;
 }
 
 async function deleteXeroConnection(accountId) {
     const normalizedAccountId = normalizeOptionalString(accountId);
-    const store = await readXeroConnections();
-    delete store.accounts[normalizedAccountId];
-    await writeXeroConnections(store);
+    if (!normalizedAccountId) {
+        return;
+    }
+
+    await ensureXeroConnectionsTable();
+
+    await pool.query(
+        `DELETE FROM xero_connections WHERE account_id = $1`,
+        [normalizedAccountId]
+    );
 }
 
 async function exchangeXeroToken(params) {
