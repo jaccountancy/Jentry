@@ -947,13 +947,16 @@ async function analyzeHandler(request, response) {
             analysisContext
         });
 
+        const enhancedExtraction = applyAccountingIntelligence(extraction, analysisContext);
+
         console.log("Receipt analysis completed.", {
-            merchant: extraction.merchant || "unknown",
-            totalText: extraction.totalText || "unknown",
-            needsReview: extraction.needsReview
+            merchant: enhancedExtraction.merchant || "unknown",
+            totalText: enhancedExtraction.totalText || "unknown",
+            needsReview: enhancedExtraction.needsReview,
+            codingConfidence: enhancedExtraction.codingConfidence ?? enhancedExtraction.extractionConfidence ?? null
         });
 
-        response.json(extraction);
+        response.json(enhancedExtraction);
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown analysis error.";
         console.error("Receipt analysis failed.", {
@@ -2489,6 +2492,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
                             codingInstructions.systemInstruction,
                             "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
+                            "Avoid lazy use of General Expenses. Use General Expenses only as a last-resort fallback when no more specific account in the chart applies. Mixed receipts must be coded line by line. Technology hardware and accessories such as AirPods, headphones, chargers, keyboards, mice, monitors, laptops, phones, tablets and computer accessories should normally use Computer Equipment or IT Software and Consumables depending on whether it is hardware or software. Tools, repairs, maintenance equipment, garden tools, cleaning equipment and premises upkeep should normally use Repairs & Maintenance unless the item is a capital asset. If the item appears personal or business purpose is unclear, flag review rather than forcing a confident code.",
                         ].join(" ")
                     }
                 ]
@@ -2708,147 +2712,851 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
 }
 
 
-function applyAccountingSanityChecks(extraction, analysisContext = null) {
-    const chartOfAccounts = Array.isArray(analysisContext?.chartOfAccounts)
-        ? analysisContext.chartOfAccounts
+
+const JACCOUNTANCY_ACCOUNTING_RULES = [
+    {
+        code: "720",
+        name: "Computer Equipment",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.9,
+        keywords: [
+            "airpods", "headphones", "earphones", "earbuds", "magsafe", "charger", "charging case",
+            "keyboard", "mouse", "monitor", "screen", "laptop", "macbook", "imac", "computer",
+            "pc", "tablet", "ipad", "iphone", "phone", "printer", "scanner", "router", "dock",
+            "usb", "cable", "webcam", "microphone", "hard drive", "ssd", "memory card"
+        ],
+        reasoning: "Technology hardware or computer accessory matched to Computer Equipment rather than General Expenses."
+    },
+    {
+        code: "463",
+        name: "IT Software and Consumables",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.88,
+        keywords: [
+            "software", "subscription", "saas", "licence", "license", "hosting", "domain", "cloud",
+            "openai", "chatgpt", "microsoft", "office 365", "google workspace", "adobe", "xero",
+            "dext", "quickbooks", "sage", "canva", "notion", "slack", "zoom", "dropbox"
+        ],
+        reasoning: "Software, cloud service or IT consumable matched to IT Software and Consumables."
+    },
+    {
+        code: "473",
+        name: "Repairs & Maintenance",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.88,
+        keywords: [
+            "repair", "repairs", "maintenance", "service", "servicing", "parts", "replacement",
+            "tool", "tools", "drill", "screwdriver", "ladder", "trimmer", "hedge trimmer",
+            "garden tool", "mower", "cleaning equipment", "premises upkeep", "fixing", "sealant",
+            "paint", "brush", "roller", "plumbing", "electrical repair"
+        ],
+        reasoning: "Tool, repair or maintenance-related item matched to Repairs & Maintenance."
+    },
+    {
+        code: "408",
+        name: "Cleaning",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["cleaning", "cleaner", "detergent", "bleach", "mop", "bucket", "janitorial", "sanitiser", "sanitizer"],
+        reasoning: "Cleaning supply or service matched to Cleaning."
+    },
+    {
+        code: "461",
+        name: "Printing & Stationery",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["stationery", "paper", "notebook", "pen", "pencil", "toner", "ink cartridge", "labels", "envelopes", "printing"],
+        reasoning: "Stationery or printing item matched to Printing & Stationery."
+    },
+    {
+        code: "425",
+        name: "Postage, Freight & Courier",
+        taxType: "Exempt Expenses",
+        confidence: 0.86,
+        keywords: ["postage", "royal mail", "parcel", "courier", "dhl", "dpd", "evri", "fedex", "ups", "shipping", "freight"],
+        reasoning: "Postage, freight or courier cost matched to Postage, Freight & Courier."
+    },
+    {
+        code: "400",
+        name: "Advertising & Marketing",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["advertising", "marketing", "facebook ads", "google ads", "linkedin ads", "leaflet", "flyer", "banner", "brand", "promotion"],
+        reasoning: "Advertising or marketing cost matched to Advertising & Marketing."
+    },
+    {
+        code: "401",
+        name: "Audit & Accountancy fees",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["accountancy", "accountant", "audit", "bookkeeping", "tax return", "payroll service", "company accounts"],
+        reasoning: "Accountancy, audit or bookkeeping service matched to Audit & Accountancy fees."
+    },
+    {
+        code: "404",
+        name: "Bank Fees",
+        taxType: "No VAT",
+        confidence: 0.9,
+        keywords: ["bank fee", "transaction fee", "card processing", "stripe fee", "sumup fee", "paypal fee", "merchant fee"],
+        reasoning: "Bank or merchant processing charge matched to Bank Fees."
+    },
+    {
+        code: "412",
+        name: "Consulting",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.82,
+        keywords: ["consulting", "consultant", "advisor", "adviser", "professional advice", "strategy session"],
+        reasoning: "Consulting or advisory service matched to Consulting."
+    },
+    {
+        code: "433",
+        name: "Insurance",
+        taxType: "Exempt Expenses",
+        confidence: 0.88,
+        keywords: ["insurance", "policy", "premium", "public liability", "professional indemnity", "pii", "cover"],
+        reasoning: "Insurance cost matched to Insurance."
+    },
+    {
+        code: "441",
+        name: "Legal Expenses",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.88,
+        keywords: ["legal", "solicitor", "lawyer", "barrister", "counsel", "court fee", "legal advice"],
+        reasoning: "Legal service or court cost matched to Legal Expenses."
+    },
+    {
+        code: "445",
+        name: "Light, Power, Heating",
+        taxType: "5% (VAT on Expenses)",
+        confidence: 0.85,
+        keywords: ["electric", "electricity", "gas", "energy", "heating", "water bill", "utility", "utilities", "power"],
+        reasoning: "Utility cost matched to Light, Power, Heating."
+    },
+    {
+        code: "449",
+        name: "Motor Vehicle Expenses",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.84,
+        keywords: ["fuel", "petrol", "diesel", "shell", "bp", "esso", "texaco", "tyre", "car wash", "mot", "vehicle repair", "parking fine"],
+        reasoning: "Vehicle running cost matched to Motor Vehicle Expenses."
+    },
+    {
+        code: "457",
+        name: "Operating Lease Payments",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.82,
+        keywords: ["lease", "leasing", "rental agreement", "operating lease"],
+        reasoning: "Lease or rental arrangement matched to Operating Lease Payments."
+    },
+    {
+        code: "465",
+        name: "Rates",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.84,
+        keywords: ["business rates", "council rates", "local authority rates"],
+        reasoning: "Business rates matched to Rates."
+    },
+    {
+        code: "469",
+        name: "Rent",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.84,
+        keywords: ["office rent", "rent", "workspace", "serviced office", "coworking", "co-working"],
+        reasoning: "Premises or workspace rent matched to Rent."
+    },
+    {
+        code: "480",
+        name: "Staff Training",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["training", "course", "seminar", "webinar", "qualification", "exam", "cpd", "workshop"],
+        reasoning: "Training, course or CPD cost matched to Staff Training."
+    },
+    {
+        code: "485",
+        name: "Subscriptions",
+        taxType: "Exempt Expenses",
+        confidence: 0.84,
+        keywords: ["membership", "subscription", "professional body", "aat", "icaew", "acca", "magazine", "journal"],
+        reasoning: "Membership or professional subscription matched to Subscriptions."
+    },
+    {
+        code: "489",
+        name: "Telephone & Internet",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.86,
+        keywords: ["telephone", "mobile bill", "phone bill", "internet", "broadband", "sim", "voip", "wifi", "wi-fi"],
+        reasoning: "Telephone, mobile or internet cost matched to Telephone & Internet."
+    },
+    {
+        code: "493",
+        name: "Travel - National",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.84,
+        keywords: ["train", "rail", "national rail", "taxi", "uber", "bolt", "bus", "tram", "parking", "hotel", "travelodge", "premier inn", "station", "airport transfer", "domestic travel"],
+        reasoning: "Domestic travel or subsistence context matched to Travel - National."
+    },
+    {
+        code: "494",
+        name: "Travel - International",
+        taxType: "No VAT",
+        confidence: 0.84,
+        keywords: ["flight", "airline", "international travel", "foreign hotel", "eurostar", "overseas"],
+        reasoning: "International travel context matched to Travel - International."
+    },
+    {
+        code: "710",
+        name: "Office Equipment",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.84,
+        keywords: ["desk", "chair", "office chair", "filing cabinet", "shredder", "whiteboard", "lamp", "office furniture"],
+        reasoning: "Office equipment or furniture matched to Office Equipment."
+    },
+    {
+        code: "420",
+        name: "Entertainment-100% business",
+        taxType: "20% (VAT on Expenses)",
+        confidence: 0.55,
+        keywords: ["client lunch", "client dinner", "business entertainment", "hospitality"],
+        requiresReview: true,
+        reasoning: "Possible business entertainment. Review deductibility and business purpose before posting."
+    },
+    {
+        code: "424",
+        name: "Entertainment - 0%",
+        taxType: "No VAT",
+        confidence: 0.5,
+        keywords: ["friends", "friend", "social", "party", "alcohol", "beer", "wine", "cocktail"],
+        requiresReview: true,
+        reasoning: "Possible non-deductible entertainment or personal/social spend. Review before posting."
+    }
+];
+
+function applyAccountingIntelligence(extraction, analysisContext = null) {
+    const normalizedExtraction = extraction && typeof extraction === "object" ? extraction : {};
+    const chartOfAccounts = normalizeChartOfAccountsForCoding(analysisContext?.chartOfAccounts);
+    const businessContext = buildBusinessContextText(analysisContext);
+    const businessProfile = classifyBusinessContext(analysisContext || {});
+    const documentText = buildDocumentText(normalizedExtraction);
+    const documentAmount = typeof normalizedExtraction.totalAmount === "number" ? normalizedExtraction.totalAmount : null;
+
+    const foodContext = detectFoodDrinkContext(documentText);
+    const resaleContext = detectResaleContext(documentText, businessContext, analysisContext);
+    const socialContext = detectSocialOrEntertainmentContext(documentText);
+    const travelContext = detectTravelContext(documentText);
+    const generalCode = findAccountByCodeOrName(chartOfAccounts, "429", "General Expenses") || {
+        code: "429",
+        name: "General Expenses",
+        taxType: "20% (VAT on Expenses)"
+    };
+
+    const originalDocumentCode = normalizeOptionalString(
+        normalizedExtraction.selectedNominalCode ||
+        normalizedExtraction.nominalCode ||
+        normalizedExtraction.accountCode
+    );
+    const originalDocumentName = normalizeOptionalString(
+        normalizedExtraction.selectedNominalCodeName ||
+        normalizedExtraction.accountName ||
+        normalizedExtraction.category
+    );
+
+    const originalDocumentLooksGeneral = isGeneralExpenseCode(originalDocumentCode, originalDocumentName);
+    const originalDocumentLooksCOGS = isCostOfGoodsSoldCode(originalDocumentCode, originalDocumentName);
+
+    if (foodContext.isFoodOrDrink && originalDocumentLooksCOGS && !resaleContext.allowed) {
+        normalizedExtraction.needsReview = true;
+        normalizedExtraction.extractionConfidence = capNumber(normalizedExtraction.extractionConfidence, socialContext.detected ? 0.55 : 0.6);
+        normalizedExtraction.codingConfidence = capNumber(normalizedExtraction.codingConfidence ?? normalizedExtraction.extractionConfidence, socialContext.detected ? 0.5 : 0.55);
+        normalizedExtraction.codingReasoning = [
+            "Blocked Cost of Goods Sold for a food/refreshment receipt because there is no evidence the items were bought for resale.",
+            socialContext.detected
+                ? "Possible social/entertainment context detected; review deductibility and business purpose."
+                : "For a normal service business this is more likely subsistence, staff welfare, refreshments, travel, or entertainment."
+        ].join(" ");
+        normalizedExtraction.selectedNominalCode = null;
+        normalizedExtraction.selectedNominalCodeName = null;
+        normalizedExtraction.nominalCode = null;
+        normalizedExtraction.accountCode = null;
+    }
+
+    const originalLineItems = Array.isArray(normalizedExtraction.lineItems)
+        ? normalizedExtraction.lineItems
         : [];
 
-    const businessDescription = [
+    const enhancedLineItems = originalLineItems.map((item) => {
+        const lineText = buildLineItemText(item, normalizedExtraction);
+        const amount = parseLineAmount(item?.amountText);
+        const existingCode = normalizeOptionalString(item?.nominalCode || item?.accountCode);
+        const existingName = normalizeOptionalString(item?.nominalCodeName || item?.accountName);
+        const existingLooksSpecific = existingCode && !isGeneralExpenseCode(existingCode, existingName) && !isCostOfGoodsSoldCode(existingCode, existingName);
+
+        let decision = decideAccountForLine({
+            lineText,
+            amount,
+            documentText,
+            businessContext,
+            chartOfAccounts,
+            existingCode,
+            existingName,
+            analysisContext
+        });
+
+        if (existingLooksSpecific && !decision.forceOverride) {
+            const existingAccount = findAccountByCodeOrName(chartOfAccounts, existingCode, existingName) || {
+                code: existingCode,
+                name: existingName,
+                taxType: normalizeOptionalString(item?.taxType || item?.taxTreatment)
+            };
+            decision = {
+                ...decision,
+                code: existingAccount.code,
+                name: existingAccount.name,
+                taxType: existingAccount.taxType || decision.taxType,
+                confidence: Math.max(decision.confidence || 0, item.codingConfidence || 0.72),
+                requiresReview: Boolean(item.requiresReview || decision.requiresReview),
+                reasoning: normalizeOptionalString(item.codingReasoning) || decision.reasoning || "Retained specific AI-selected coding because it was not a generic fallback."
+            };
+        }
+
+        if (isCostOfGoodsSoldCode(decision.code, decision.name) && !resaleContext.allowed) {
+            decision = {
+                code: null,
+                name: null,
+                taxType: normalizeOptionalString(item?.taxType || item?.taxTreatment) || null,
+                confidence: 0.5,
+                requiresReview: true,
+                reasoning: "Blocked Cost of Goods Sold because resale/direct production context was not clear."
+            };
+        }
+
+        if (!decision.code && (isGeneralExpenseCode(existingCode, existingName) || !existingCode)) {
+            decision = {
+                code: generalCode.code,
+                name: generalCode.name,
+                taxType: normalizeOptionalString(item?.taxType || item?.taxTreatment) || generalCode.taxType || null,
+                confidence: 0.45,
+                requiresReview: true,
+                reasoning: "No stronger chart-of-accounts match was found. General Expenses used only as a review fallback."
+            };
+        }
+
+        const taxDecision = chooseTaxTreatment({
+            existingTaxType: item?.taxType,
+            existingTaxTreatment: item?.taxTreatment,
+            documentTaxType: normalizedExtraction.taxType || normalizedExtraction.selectedTaxType,
+            documentTaxTreatment: normalizedExtraction.taxTreatment,
+            accountTaxType: decision.taxType,
+            document: normalizedExtraction
+        });
+
+        return {
+            ...item,
+            nominalCode: decision.code || null,
+            nominalCodeName: decision.name || null,
+            accountCode: decision.code || null,
+            taxType: taxDecision.taxType,
+            taxTreatment: taxDecision.taxTreatment,
+            codingReasoning: decision.reasoning || normalizeOptionalString(item?.codingReasoning) || null,
+            codingConfidence: clampConfidenceValue(decision.confidence ?? item?.codingConfidence ?? normalizedExtraction.codingConfidence ?? 0.6),
+            requiresReview: Boolean(item?.requiresReview || decision.requiresReview)
+        };
+    });
+
+    if (enhancedLineItems.length > 0) {
+        normalizedExtraction.lineItems = enhancedLineItems;
+        normalizedExtraction.lineItemsWithAICoding = enhancedLineItems;
+    }
+
+    const lineCodes = [...new Set(enhancedLineItems.map((item) => normalizeOptionalString(item.nominalCode)).filter(Boolean))];
+    const reviewRequiredByLines = enhancedLineItems.some((item) => item.requiresReview || (item.codingConfidence ?? 0) < 0.6);
+
+    if (lineCodes.length === 1) {
+        const line = enhancedLineItems.find((item) => normalizeOptionalString(item.nominalCode) === lineCodes[0]);
+        normalizedExtraction.selectedNominalCode = line.nominalCode;
+        normalizedExtraction.selectedNominalCodeName = line.nominalCodeName;
+        normalizedExtraction.nominalCode = line.nominalCode;
+        normalizedExtraction.accountCode = line.nominalCode;
+        normalizedExtraction.selectedTaxType = line.taxType || normalizedExtraction.selectedTaxType || null;
+        normalizedExtraction.taxType = line.taxType || normalizedExtraction.taxType || null;
+        normalizedExtraction.taxTreatment = line.taxTreatment || normalizedExtraction.taxTreatment || null;
+        normalizedExtraction.codingConfidence = averageLineConfidence(enhancedLineItems);
+        normalizedExtraction.codingReasoning = line.codingReasoning || normalizedExtraction.codingReasoning || null;
+        normalizedExtraction.category = line.nominalCodeName || normalizedExtraction.category;
+    } else if (lineCodes.length > 1) {
+        normalizedExtraction.selectedNominalCode = null;
+        normalizedExtraction.selectedNominalCodeName = "Mixed expense categories";
+        normalizedExtraction.nominalCode = null;
+        normalizedExtraction.accountCode = null;
+        normalizedExtraction.category = "Mixed expenses";
+        normalizedExtraction.codingConfidence = averageLineConfidence(enhancedLineItems);
+        normalizedExtraction.codingReasoning = "Mixed receipt coded line-by-line rather than forcing the whole receipt into General Expenses.";
+    } else if (originalDocumentLooksGeneral || !originalDocumentCode) {
+        normalizedExtraction.selectedNominalCode = generalCode.code;
+        normalizedExtraction.selectedNominalCodeName = generalCode.name;
+        normalizedExtraction.nominalCode = generalCode.code;
+        normalizedExtraction.accountCode = generalCode.code;
+        normalizedExtraction.codingConfidence = Math.min(normalizedExtraction.codingConfidence ?? normalizedExtraction.extractionConfidence ?? 0.6, 0.55);
+        normalizedExtraction.codingReasoning = normalizedExtraction.codingReasoning || "General Expenses is a fallback only because no more specific coding decision could be made.";
+        normalizedExtraction.needsReview = true;
+    }
+
+    if (foodContext.isFoodOrDrink && documentAmount != null && documentAmount < 30 && !resaleContext.allowed) {
+        normalizedExtraction.needsReview = true;
+        normalizedExtraction.codingConfidence = capNumber(normalizedExtraction.codingConfidence, socialContext.detected ? 0.55 : 0.7);
+        normalizedExtraction.extractionConfidence = capNumber(normalizedExtraction.extractionConfidence, socialContext.detected ? 0.6 : 0.75);
+        if (!normalizedExtraction.codingReasoning) {
+            normalizedExtraction.codingReasoning = socialContext.detected
+                ? "Low-value food/drink receipt with possible social context. Review as subsistence, staff welfare, refreshments, or entertainment."
+                : "Low-value food/drink receipt. Review business purpose before posting.";
+        }
+    }
+
+    if (travelContext.detected && !foodContext.isFoodOrDrink && (!normalizedExtraction.category || normalizedExtraction.category === "General Expenses")) {
+        normalizedExtraction.category = "Travel";
+    }
+
+    if (reviewRequiredByLines) {
+        normalizedExtraction.needsReview = true;
+    }
+
+    const documentGuard = detectDangerousAccountDecision(
+        normalizedExtraction.selectedNominalCode || normalizedExtraction.nominalCode || normalizedExtraction.accountCode,
+        normalizedExtraction.selectedNominalCodeName || normalizedExtraction.category,
+        documentText,
+        analysisContext
+    );
+
+    if (documentGuard.dangerous) {
+        normalizedExtraction.needsReview = true;
+        normalizedExtraction.codingConfidence = Math.min(normalizedExtraction.codingConfidence ?? 0.5, 0.45);
+        normalizedExtraction.codingReasoning = `${documentGuard.reason} Document-level coding blocked and flagged for review.`;
+        normalizedExtraction.blockedAccountCode = normalizedExtraction.selectedNominalCode || normalizedExtraction.nominalCode || normalizedExtraction.accountCode || null;
+        normalizedExtraction.blockedAccountName = normalizedExtraction.selectedNominalCodeName || normalizedExtraction.category || null;
+        normalizedExtraction.selectedNominalCode = null;
+        normalizedExtraction.selectedNominalCodeName = null;
+        normalizedExtraction.nominalCode = null;
+        normalizedExtraction.accountCode = null;
+    }
+
+    normalizedExtraction.bookkeepingContext = compactObject({
+        natureOfBusiness: normalizeOptionalString(analysisContext?.natureOfBusiness || analysisContext?.businessNature || analysisContext?.businessType || analysisContext?.industry),
+        businessProfile: compactObject({
+            foodTrade: businessProfile.isFoodTrade,
+            constructionOrMaintenanceTrade: businessProfile.isConstructionOrMaintenanceTrade,
+            professionalService: businessProfile.isProfessionalService,
+            retailOrResaleTrade: businessProfile.isRetailOrResaleTrade
+        })
+    });
+
+    normalizedExtraction.codingExplanation = normalizedExtraction.codingReasoning || (reviewRequiredByLines
+        ? "One or more line items require review because the coding confidence was below the auto-posting threshold."
+        : "Coding selected using chart-of-accounts matching, business-context rules and receipt line-item analysis.");
+
+    normalizedExtraction.extractionConfidence = clampConfidenceValue(normalizedExtraction.extractionConfidence);
+    normalizedExtraction.codingConfidence = clampConfidenceValue(normalizedExtraction.codingConfidence ?? normalizedExtraction.extractionConfidence);
+
+    return normalizedExtraction;
+}
+
+function applyAccountingSanityChecks(extraction, analysisContext = null) {
+    return applyAccountingIntelligence(extraction, analysisContext);
+}
+
+function normalizeChartOfAccountsForCoding(chartOfAccounts) {
+    const supplied = Array.isArray(chartOfAccounts) ? chartOfAccounts : [];
+    const normalized = supplied
+        .map((account) => ({
+            code: normalizeOptionalString(account.code || account.Code || account["*Code"]),
+            name: normalizeOptionalString(account.name || account.Name || account["*Name"]),
+            type: normalizeOptionalString(account.type || account.Type || account["*Type"]) || null,
+            taxType: normalizeOptionalString(account.taxType || account.TaxType || account["*Tax Code"]) || null,
+            description: normalizeOptionalString(account.description || account.Description) || null
+        }))
+        .filter((account) => account.code && account.name);
+
+    if (normalized.length > 0) return normalized;
+
+    return [
+        { code: "310", name: "Cost of Goods Sold", type: "Direct Costs", taxType: "20% (VAT on Expenses)" },
+        { code: "400", name: "Advertising & Marketing", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "401", name: "Audit & Accountancy fees", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "404", name: "Bank Fees", type: "Overhead", taxType: "No VAT" },
+        { code: "408", name: "Cleaning", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "412", name: "Consulting", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "420", name: "Entertainment-100% business", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "424", name: "Entertainment - 0%", type: "Overhead", taxType: "No VAT" },
+        { code: "425", name: "Postage, Freight & Courier", type: "Overhead", taxType: "Exempt Expenses" },
+        { code: "429", name: "General Expenses", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "433", name: "Insurance", type: "Overhead", taxType: "Exempt Expenses" },
+        { code: "441", name: "Legal Expenses", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "445", name: "Light, Power, Heating", type: "Overhead", taxType: "5% (VAT on Expenses)" },
+        { code: "449", name: "Motor Vehicle Expenses", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "457", name: "Operating Lease Payments", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "461", name: "Printing & Stationery", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "463", name: "IT Software and Consumables", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "465", name: "Rates", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "469", name: "Rent", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "473", name: "Repairs & Maintenance", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "480", name: "Staff Training", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "485", name: "Subscriptions", type: "Overhead", taxType: "Exempt Expenses" },
+        { code: "489", name: "Telephone & Internet", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "493", name: "Travel - National", type: "Overhead", taxType: "20% (VAT on Expenses)" },
+        { code: "494", name: "Travel - International", type: "Overhead", taxType: "No VAT" },
+        { code: "710", name: "Office Equipment", type: "Fixed Asset", taxType: "20% (VAT on Expenses)" },
+        { code: "720", name: "Computer Equipment", type: "Fixed Asset", taxType: "20% (VAT on Expenses)" },
+        { code: "764", name: "Plant and Machinery", type: "Fixed Asset", taxType: "20% (VAT on Expenses)" }
+    ];
+}
+
+function decideAccountForLine({ lineText, amount, documentText, businessContext, chartOfAccounts, existingCode, existingName, analysisContext = null }) {
+    const text = normalizeComparableWords(`${lineText} ${documentText}`);
+    const lineOnlyText = normalizeComparableWords(lineText);
+
+    const foodContext = detectFoodDrinkContext(text);
+    const resaleContext = detectResaleContext(text, businessContext, analysisContext);
+    const socialContext = detectSocialOrEntertainmentContext(text);
+
+    if (foodContext.isFoodOrDrink && !resaleContext.allowed) {
+        const travelContext = detectTravelContext(text);
+        if (socialContext.detected) {
+            const entertainment = findAccountByCodeOrName(chartOfAccounts, "424", "Entertainment - 0%");
+            return {
+                code: entertainment?.code || null,
+                name: entertainment?.name || null,
+                taxType: entertainment?.taxType || null,
+                confidence: 0.5,
+                requiresReview: true,
+                reasoning: "Food/drink with social or unclear attendee context. Review as entertainment or personal spend before posting.",
+                forceOverride: isCostOfGoodsSoldCode(existingCode, existingName)
+            };
+        }
+
+        if (travelContext.detected) {
+            const travel = findAccountByCodeOrName(chartOfAccounts, "493", "Travel - National");
+            return {
+                code: travel?.code || null,
+                name: travel?.name || null,
+                taxType: travel?.taxType || null,
+                confidence: 0.68,
+                requiresReview: true,
+                reasoning: "Food/drink appears travel or subsistence related. Review business purpose before posting.",
+                forceOverride: isCostOfGoodsSoldCode(existingCode, existingName)
+            };
+        }
+
+        return {
+            code: null,
+            name: null,
+            taxType: null,
+            confidence: 0.55,
+            requiresReview: true,
+            reasoning: "Food/refreshment item should not be posted to Cost of Goods Sold unless purchased for resale. Review whether it is subsistence, staff welfare, refreshments, entertainment, or personal.",
+            forceOverride: isCostOfGoodsSoldCode(existingCode, existingName)
+        };
+    }
+
+    const matchedRule = findBestAccountingRule(lineOnlyText || text);
+    if (matchedRule) {
+        const account = findAccountByCodeOrName(chartOfAccounts, matchedRule.code, matchedRule.name) || matchedRule;
+        return applyDangerousAccountGuard({
+            code: account.code,
+            name: account.name,
+            taxType: account.taxType || matchedRule.taxType || null,
+            confidence: matchedRule.confidence,
+            requiresReview: Boolean(matchedRule.requiresReview),
+            reasoning: matchedRule.reasoning,
+            forceOverride: isGeneralExpenseCode(existingCode, existingName) || isCostOfGoodsSoldCode(existingCode, existingName)
+        }, { text: `${lineText} ${documentText}`, analysisContext, existingCode, existingName });
+    }
+
+    if (isCostOfGoodsSoldCode(existingCode, existingName) && !resaleContext.allowed) {
+        return {
+            code: null,
+            name: null,
+            taxType: null,
+            confidence: 0.5,
+            requiresReview: true,
+            reasoning: "Cost of Goods Sold requires clear resale/direct production evidence. No such evidence was detected.",
+            forceOverride: true
+        };
+    }
+
+    if (resaleContext.allowed && isCostOfGoodsSoldCode(existingCode, existingName)) {
+        const cogs = findAccountByCodeOrName(chartOfAccounts, "310", "Cost of Goods Sold");
+        return {
+            code: cogs?.code || existingCode,
+            name: cogs?.name || existingName || "Cost of Goods Sold",
+            taxType: cogs?.taxType || null,
+            confidence: 0.82,
+            requiresReview: false,
+            reasoning: "Cost of Goods Sold retained because resale/direct production context was detected."
+        };
+    }
+
+    return {
+        code: null,
+        name: null,
+        taxType: null,
+        confidence: null,
+        requiresReview: false,
+        reasoning: null,
+        forceOverride: false
+    };
+}
+
+function findBestAccountingRule(text) {
+    const normalized = normalizeComparableWords(text);
+    if (!normalized) return null;
+
+    const matches = JACCOUNTANCY_ACCOUNTING_RULES
+        .map((rule) => {
+            const hitCount = rule.keywords.filter((keyword) => normalized.includes(normalizeComparableWords(keyword))).length;
+            const longestHit = rule.keywords
+                .filter((keyword) => normalized.includes(normalizeComparableWords(keyword)))
+                .sort((lhs, rhs) => rhs.length - lhs.length)[0] || "";
+            return { rule, hitCount, longestHitLength: longestHit.length };
+        })
+        .filter((entry) => entry.hitCount > 0)
+        .sort((lhs, rhs) => rhs.hitCount - lhs.hitCount || rhs.longestHitLength - lhs.longestHitLength || rhs.rule.confidence - lhs.rule.confidence);
+
+    return matches[0]?.rule || null;
+}
+
+function findAccountByCodeOrName(chartOfAccounts, code, name) {
+    const normalizedCode = normalizeOptionalString(code);
+    const normalizedName = normalizeComparableText(name);
+    return chartOfAccounts.find((account) => account.code === normalizedCode)
+        || chartOfAccounts.find((account) => normalizeComparableText(account.name) === normalizedName)
+        || chartOfAccounts.find((account) => normalizedName && normalizeComparableText(account.name).includes(normalizedName))
+        || null;
+}
+
+function buildBusinessContextText(analysisContext) {
+    return [
+        analysisContext?.natureOfBusiness,
+        analysisContext?.businessNature,
         analysisContext?.businessType,
         analysisContext?.industry,
+        analysisContext?.sector,
+        analysisContext?.sicDescription,
         analysisContext?.companyName,
         analysisContext?.clientName,
-        analysisContext?.businessDescription
+        analysisContext?.businessDescription,
+        analysisContext?.tradeDescription,
+        analysisContext?.clientNotes
     ].map(normalizeOptionalString).join(" ").toLowerCase();
+}
 
-    const textParts = [
-        extraction.merchant,
-        extraction.category,
-        extraction.summary,
-        extraction.shortDescription,
-        extraction.longDescription,
-        extraction.recognizedText,
-        ...(Array.isArray(extraction.extractedLines) ? extraction.extractedLines : []),
-        ...(Array.isArray(extraction.lineItems) ? extraction.lineItems.map((item) => item.name) : [])
+function classifyBusinessContext(analysisContext) {
+    const context = normalizeComparableWords(buildBusinessContextText(analysisContext));
+
+    const foodTrade = ["restaurant", "cafe", "catering", "takeaway", "hospitality", "pub", "bar", "food manufacturer", "bakery", "butcher", "greengrocer", "food retail"];
+    const constructionTrade = ["builder", "construction", "joiner", "electrician", "plumber", "landscaping", "gardener", "property maintenance", "contractor", "tradesman", "tradesperson"];
+    const professionalService = ["accountant", "accountancy", "bookkeeper", "consultant", "solicitor", "law firm", "marketing agency", "agency", "consultancy", "professional services"];
+    const retailTrade = ["retail", "shop", "ecommerce", "e-commerce", "online store", "wholesale", "reseller", "resale"];
+
+    return {
+        raw: context,
+        isFoodTrade: foodTrade.some((keyword) => context.includes(normalizeComparableWords(keyword))),
+        isConstructionOrMaintenanceTrade: constructionTrade.some((keyword) => context.includes(normalizeComparableWords(keyword))),
+        isProfessionalService: professionalService.some((keyword) => context.includes(normalizeComparableWords(keyword))),
+        isRetailOrResaleTrade: retailTrade.some((keyword) => context.includes(normalizeComparableWords(keyword)))
+    };
+}
+
+function buildDocumentText(extraction) {
+    return [
+        extraction?.merchant,
+        extraction?.category,
+        extraction?.summary,
+        extraction?.shortDescription,
+        extraction?.longDescription,
+        extraction?.recognizedText,
+        ...(Array.isArray(extraction?.extractedLines) ? extraction.extractedLines : []),
+        ...(Array.isArray(extraction?.lineItems) ? extraction.lineItems.map((item) => buildLineItemText(item, extraction)) : [])
     ].map(normalizeOptionalString).join(" ").toLowerCase();
+}
 
-    const foodKeywords = [
+function buildLineItemText(item, extraction = {}) {
+    return [
+        item?.name,
+        item?.description,
+        item?.summary,
+        item?.amountText,
+        extraction?.merchant
+    ].map(normalizeOptionalString).join(" ").toLowerCase();
+}
+
+function normalizeComparableWords(value) {
+    return normalizeOptionalString(value)
+        .toLowerCase()
+        .replace(/&/g, " and ")
+        .replace(/[^a-z0-9£.\s-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function detectFoodDrinkContext(text) {
+    const normalized = normalizeComparableWords(text);
+    const keywords = [
         "restaurant", "cafe", "café", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
         "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
         "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
-        "goujons", "via", "greggs", "mcdonald", "costa", "starbucks", "pret"
+        "goujons", "greggs", "mcdonald", "mcdonalds", "costa", "starbucks", "pret",
+        "subway", "kfc", "nando", "via"
     ];
+    return {
+        isFoodOrDrink: keywords.some((keyword) => normalized.includes(normalizeComparableWords(keyword)))
+    };
+}
 
-    const socialKeywords = [
+function detectSocialOrEntertainmentContext(text) {
+    const normalized = normalizeComparableWords(text);
+    const keywords = [
         "friend", "friends", "guest", "guests", "client lunch", "client dinner", "alcohol",
-        "beer", "wine", "cocktail", "social", "party", "entertainment"
+        "beer", "wine", "cocktail", "social", "party", "entertainment", "hospitality"
+    ];
+    return { detected: keywords.some((keyword) => normalized.includes(normalizeComparableWords(keyword))) };
+}
+
+function detectTravelContext(text) {
+    const normalized = normalizeComparableWords(text);
+    const keywords = [
+        "train", "rail", "national rail", "taxi", "uber", "bolt", "bus", "tram", "parking",
+        "hotel", "travelodge", "premier inn", "station", "airport", "journey", "travel",
+        "motorway services", "service station"
+    ];
+    return { detected: keywords.some((keyword) => normalized.includes(normalizeComparableWords(keyword))) };
+}
+
+function detectResaleContext(text, businessContext, analysisContext = null) {
+    const normalized = normalizeComparableWords(`${text} ${businessContext}`);
+    const businessProfile = classifyBusinessContext(analysisContext || { natureOfBusiness: businessContext });
+    const resaleKeywords = [
+        "resale", "stock", "inventory", "wholesale", "goods for sale", "cost of sales",
+        "raw materials", "production", "manufacturing", "for onward sale", "retail stock"
     ];
 
-    const travelKeywords = [
-        "train", "rail", "national rail", "taxi", "uber", "bolt", "parking", "hotel",
-        "travel", "station", "airport", "bus", "tram"
+    return {
+        allowed: resaleKeywords.some((keyword) => normalized.includes(normalizeComparableWords(keyword)))
+            || businessProfile.isFoodTrade
+            || businessProfile.isRetailOrResaleTrade,
+        businessProfile
+    };
+}
+
+function detectDangerousAccountDecision(code, name, text = "", analysisContext = null) {
+    const normalized = `${normalizeOptionalString(code)} ${normalizeOptionalString(name)}`.toLowerCase();
+    const evidence = normalizeComparableWords(text);
+    const businessProfile = classifyBusinessContext(analysisContext || {});
+
+    const dangerousRules = [
+        { pattern: /(^|\D)(200|260|270)(\D|$)|revenue|sales|interest income/, reason: "Income accounts should not be selected for supplier bills or expense receipts." },
+        { pattern: /(^|\D)(477|478|320)(\D|$)|salaries|wages|director|employee pay/, reason: "Payroll and wages accounts require payroll evidence, not a normal receipt." },
+        { pattern: /(^|\D)(500|505|510|515|520|525|530)(\D|$)|fixed asset|asset|accumulated depreciation/, reason: "Fixed asset accounts require capitalisation judgement and should not be auto-posted without review." },
+        { pattern: /(^|\D)(610|620|630|800|801|820|825|830|835|840|850|860|877)(\D|$)|vat|paye|nic|corporation tax|loan|retained earnings|dividend|suspense/, reason: "Control, tax, loan, equity and suspense accounts must not be selected automatically from receipt text." }
     ];
 
-    const softwareKeywords = [
-        "software", "subscription", "saas", "cloud", "hosting", "openai", "microsoft",
-        "google", "adobe", "xero", "dext", "quickbooks"
-    ];
-
-    const fuelKeywords = ["fuel", "petrol", "diesel", "shell", "bp", "esso", "texaco"];
-
-    const isFoodOrDrink = foodKeywords.some((keyword) => textParts.includes(keyword));
-    const hasSocialContext = socialKeywords.some((keyword) => textParts.includes(keyword));
-    const isTravel = travelKeywords.some((keyword) => textParts.includes(keyword));
-    const isSoftware = softwareKeywords.some((keyword) => textParts.includes(keyword));
-    const isFuel = fuelKeywords.some((keyword) => textParts.includes(keyword));
-
-    const totalAmount = typeof extraction.totalAmount === "number" ? extraction.totalAmount : null;
-    const codeName = `${extraction.selectedNominalCode || ""} ${extraction.selectedNominalCodeName || ""} ${extraction.nominalCode || ""} ${extraction.accountCode || ""}`.toLowerCase();
-    const isCostOfGoodsSold = /(^|\D)(310|3100|5000)(\D|$)/.test(codeName) || codeName.includes("cost of goods") || codeName.includes("cost of sales") || codeName.includes("cogs");
-
-    const businessAllowsFoodCOGS =
-        businessDescription.includes("restaurant") ||
-        businessDescription.includes("cafe") ||
-        businessDescription.includes("café") ||
-        businessDescription.includes("food") ||
-        businessDescription.includes("catering") ||
-        businessDescription.includes("hospitality") ||
-        businessDescription.includes("takeaway");
-
-    const receiptSuggestsResale =
-        textParts.includes("wholesale") ||
-        textParts.includes("stock") ||
-        textParts.includes("inventory") ||
-        textParts.includes("resale") ||
-        textParts.includes("ingredients for resale") ||
-        textParts.includes("catering stock");
-
-    if (isFoodOrDrink && isCostOfGoodsSold && !businessAllowsFoodCOGS && !receiptSuggestsResale) {
-        extraction.needsReview = true;
-        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.6, 0.55);
-        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.55, 0.55);
-        extraction.codingReasoning = [
-            "Food or refreshment receipt was blocked from Cost of Goods Sold because there is no evidence the items were bought for resale.",
-            "For a service business this is more likely subsistence, travel, staff welfare, refreshments, or entertainment.",
-            hasSocialContext ? "Social/friends/guest context was detected, so review is required." : "Business purpose is unclear, so review is required."
-        ].filter(Boolean).join(" ");
-
-        extraction.selectedNominalCode = null;
-        extraction.selectedNominalCodeName = null;
-        extraction.nominalCode = null;
-        extraction.accountCode = null;
-
-        if (Array.isArray(extraction.lineItems)) {
-            extraction.lineItems = extraction.lineItems.map((item) => ({
-                ...item,
-                nominalCode: null,
-                nominalCodeName: null,
-                requiresReview: true,
-                codingConfidence: Math.min(item.codingConfidence ?? 0.55, 0.55),
-                codingReasoning: "Food/refreshment item should not be posted to Cost of Goods Sold unless purchased for resale. Review business purpose before posting."
-            }));
+    for (const rule of dangerousRules) {
+        if (rule.pattern.test(normalized)) {
+            return { dangerous: true, reason: rule.reason };
         }
     }
 
-    if (isFoodOrDrink && totalAmount != null && totalAmount < 30 && !businessAllowsFoodCOGS && !receiptSuggestsResale) {
-        extraction.needsReview = true;
-        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.65, hasSocialContext ? 0.5 : 0.7);
-        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.7, hasSocialContext ? 0.55 : 0.75);
-
-        if (!extraction.codingReasoning) {
-            extraction.codingReasoning = hasSocialContext
-                ? "Low-value food/drink receipt with possible social context. Treat as subsistence, staff welfare, refreshments, or entertainment only after review."
-                : "Low-value food/drink receipt. This is usually subsistence, staff welfare, refreshments, or travel-related expense rather than Cost of Goods Sold.";
+    if (isCostOfGoodsSoldCode(code, name)) {
+        const resaleEvidence = ["resale", "stock", "inventory", "wholesale", "raw material", "production", "manufacturing", "for onward sale", "cost of sales"]
+            .some((keyword) => evidence.includes(normalizeComparableWords(keyword)));
+        if (!resaleEvidence && !businessProfile.isFoodTrade && !businessProfile.isRetailOrResaleTrade) {
+            return {
+                dangerous: true,
+                reason: "Cost of Goods Sold requires clear resale, stock, direct production, food-trade or retail context. None was detected."
+            };
         }
     }
 
-    if (hasSocialContext) {
-        extraction.needsReview = true;
-        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.55, 0.55);
-        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.6, 0.6);
+    return { dangerous: false, reason: null };
+}
+
+function applyDangerousAccountGuard(decision, { text = "", analysisContext = null, existingCode = "", existingName = "" } = {}) {
+    const guard = detectDangerousAccountDecision(decision?.code, decision?.name, text, analysisContext);
+    if (!guard.dangerous) return decision;
+
+    return {
+        ...decision,
+        code: null,
+        name: null,
+        taxType: decision?.taxType || null,
+        confidence: Math.min(decision?.confidence ?? 0.5, 0.45),
+        requiresReview: true,
+        forceOverride: true,
+        blockedAccountCode: decision?.code || existingCode || null,
+        blockedAccountName: decision?.name || existingName || null,
+        reasoning: `${guard.reason} Blocked automatic posting and flagged for accountant review.`
+    };
+}
+
+function isGeneralExpenseCode(code, name) {
+    const normalized = `${normalizeOptionalString(code)} ${normalizeOptionalString(name)}`.toLowerCase();
+    return /(^|\D)429(\D|$)/.test(normalized) || normalized.includes("general expenses");
+}
+
+function isCostOfGoodsSoldCode(code, name) {
+    const normalized = `${normalizeOptionalString(code)} ${normalizeOptionalString(name)}`.toLowerCase();
+    return /(^|\D)310(\D|$)/.test(normalized)
+        || normalized.includes("cost of goods")
+        || normalized.includes("cost of sales")
+        || normalized.includes("cogs");
+}
+
+function parseLineAmount(value) {
+    const parsed = Number(normalizeOptionalString(value).replace(/[^0-9.-]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function chooseTaxTreatment({
+    existingTaxType,
+    existingTaxTreatment,
+    documentTaxType,
+    documentTaxTreatment,
+    accountTaxType,
+    document
+}) {
+    const existing = normalizeOptionalString(existingTaxType || existingTaxTreatment || documentTaxType || documentTaxTreatment);
+    const recognizedText = normalizeComparableWords(document?.recognizedText || "");
+    const vatAmount = typeof document?.vatAmount === "number" ? document.vatAmount : null;
+
+    if (existing) {
+        return { taxType: existing, taxTreatment: existing };
     }
 
-    if (isTravel && !isFoodOrDrink) {
-        extraction.category = extraction.category || "Travel";
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat £0")) {
+        return { taxType: "No VAT", taxTreatment: "No VAT" };
     }
 
-    if (isSoftware) {
-        extraction.category = extraction.category || "Software";
+    if (accountTaxType) {
+        return { taxType: accountTaxType, taxTreatment: accountTaxType };
     }
 
-    if (isFuel) {
-        extraction.category = extraction.category || "Motor expenses";
-    }
+    return { taxType: null, taxTreatment: null };
+}
 
-    if (Array.isArray(extraction.lineItems)) {
-        extraction.lineItems = extraction.lineItems.map((item) => ({
-            ...item,
-            taxTreatment: normalizeOptionalString(item.taxTreatment) || normalizeOptionalString(item.taxType) || normalizeOptionalString(extraction.taxTreatment) || null,
-            codingConfidence: typeof item.codingConfidence === "number" ? Math.max(0, Math.min(1, item.codingConfidence)) : extraction.codingConfidence
-        }));
-    }
+function averageLineConfidence(lineItems) {
+    const values = lineItems
+        .map((item) => typeof item.codingConfidence === "number" ? item.codingConfidence : null)
+        .filter((value) => value != null);
+    if (values.length === 0) return null;
+    return clampConfidenceValue(values.reduce((sum, value) => sum + value, 0) / values.length);
+}
 
-    return extraction;
+function clampConfidenceValue(value) {
+    if (typeof value !== "number" || Number.isNaN(value)) return 0.6;
+    return Math.max(0, Math.min(1, value));
+}
+
+function capNumber(value, maximum) {
+    const normalized = typeof value === "number" && !Number.isNaN(value) ? value : maximum;
+    return Math.min(normalized, maximum);
 }
 
 function buildXeroCodingInstructions(analysisContext) {
@@ -2876,13 +3584,22 @@ function buildXeroCodingInstructions(analysisContext) {
 
     const accountListJSON = JSON.stringify(allowedAccounts);
     return {
-        systemInstruction: "When Xero chart-of-accounts context is supplied, choose the best matching nominal code from that list using the merchant, line descriptions, invoice context, and normal bookkeeping intent. Do not invent codes. Prefer the most specific valid expense account and carry the account default tax type where appropriate.",
+        systemInstruction: [
+            "When Xero chart-of-accounts context is supplied, choose the best matching nominal code from that list using merchant, line descriptions, invoice context, VAT evidence, and normal bookkeeping intent.",
+            "Use the client's nature of business as decisive context: the same item may be COGS for a restaurant/retailer but an overhead, subsistence, staff welfare, repairs, equipment, or review item for a professional service business.",
+            "Do not invent account codes. Prefer specific accounts over General Expenses. Never select dangerous control, tax, payroll, loan, equity, suspense, income, or fixed asset accounts unless the document gives clear evidence and review is flagged where judgement is required.",
+            "Every coding decision must include concise accounting reasoning that explains why the account is appropriate and why obvious alternatives were rejected."
+        ].join(" "),
         userInstruction: [
-            "Use the supplied Xero chart of accounts to choose document-level and line-level coding.",
+            "Use the supplied Xero chart of accounts and the client's nature of business to choose document-level and line-level coding.",
             "Return selectedNominalCode and selectedNominalCodeName using only one of the supplied accounts.",
             "Return selectedTaxType using the chosen account default tax type when appropriate, or another clearly better tax type if the document evidence supports it.",
             "For each line item, return nominalCode, nominalCodeName, taxType, taxRateText, codingReasoning, codingConfidence, and requiresReview.",
+            "If a receipt contains mixed goods, classify each line separately instead of using one generic category for the whole receipt.",
+            "Use General Expenses only as a last resort after considering all specific accounts.",
             "If a line item is too ambiguous, leave the coding fields null, set requiresReview to true, and explain why in codingReasoning.",
+            "Block or review dangerous accounts: COGS without resale/direct production context; payroll/wages; VAT/PAYE/tax control accounts; loans; dividends/equity; suspense; income accounts; and fixed assets where capitalisation judgement is needed.",
+            `Client business context: ${normalizeOptionalString(analysisContext?.natureOfBusiness || analysisContext?.businessNature || analysisContext?.businessType || analysisContext?.industry || analysisContext?.businessDescription) || "not provided"}.`,
             `Allowed Xero accounts: ${accountListJSON}`
         ].join(" ")
     };
