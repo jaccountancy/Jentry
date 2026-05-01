@@ -18,7 +18,7 @@ const __dirname = path.dirname(__filename);
 const requiredEnvironmentVariables = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
-    "GOOGLE_REFRESH_TOKEN",a
+    "GOOGLE_REFRESH_TOKEN",
     "GMAIL_SENDER"
 ];
 
