@@ -1593,7 +1593,7 @@ async function findMatchingXeroTransactions({ accessToken, tenantId, document })
         }))
         : [];
 
-    return [...invoiceMatches, ...bankMatches)
+    return [...invoiceMatches, ...bankMatches]
         .map((candidate) => scoreTransactionMatch(candidate, {
             merchant,
             totalAmount,
