@@ -2072,17 +2072,16 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         text: [
                             "You extract fields from receipts and invoices.",
                             "Read the document image carefully and return only the structured JSON requested.",
-                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."[...]
-    
+                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice.",
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
-                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine t[...]
+                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine text.",
                             "If a PDF is supplied, it has been converted to an image preview of its first page before analysis.",
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses [...]
-                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or in[...]
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses in the title.",
+                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or invoice details."
                         ].join(" ")
                     }
                 ]
@@ -2093,7 +2092,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                     {
                         type: "input_text",
                         text: [
-                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longe[...]
+                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longer description.",
                             "Return titleVendor as the best vendor name for naming the document, and titleAmountText as the best final paid amount text for naming the document.",
                             capturedAt ? `If the document date is unreadable, you may use this fallback capture timestamp: ${capturedAt}.` : "",
                             "Recognized text should contain the important visible text from the document.",
@@ -2159,6 +2158,101 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         summary: { type: "string" },
                         needsReview: { type: "boolean" },
                         extractionConfidence: { type: "number" }
+                    },
+                    required: [
+                        "recognizedText",
+                        "merchant",
+                        "totalAmount",
+                        "currency",
+                        "totalText",
+                        "titleVendor",
+                        "titleAmountText",
+                        "vatAmount",
+                        "vatText",
+                        "dateISO",
+                        "dateText",
+                        "invoiceNumber",
+                        "paymentMethod",
+                        "category",
+                        "suggestedTitle",
+                        "shortDescription",
+                        "longDescription",
+                        "lineItems",
+                        "extractedLines",
+                        "summary",
+                        "needsReview",
+                        "extractionConfidence"
+                    ]
+                }
+            }
+        }
+    };
+
+    const apiResponse = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${optionalEnvironmentVariables.openAIAPIKey}`,
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(body)
+    });
+
+    const rawResponse = await apiResponse.text();
+
+    if (!apiResponse.ok) {
+        throw new Error(`OpenAI extraction failed: ${rawResponse}`);
+    }
+
+    const parsedResponse = JSON.parse(rawResponse);
+    const outputText = typeof parsedResponse.output_text === "string"
+        ? parsedResponse.output_text
+        : extractOutputText(parsedResponse);
+
+    if (!outputText) {
+        throw new Error("OpenAI extraction returned no JSON payload.");
+    }
+
+    const extraction = JSON.parse(outputText);
+
+    return {
+        recognizedText: normalizeOptionalString(extraction.recognizedText),
+        merchant: normalizeOptionalString(extraction.merchant) || null,
+        totalAmount: typeof extraction.totalAmount === "number" ? extraction.totalAmount : null,
+        currency: normalizeOptionalString(extraction.currency) || "GBP",
+        totalText: normalizeOptionalString(extraction.totalText) || null,
+        titleVendor: normalizeOptionalString(extraction.titleVendor) || null,
+        titleAmountText: normalizeOptionalString(extraction.titleAmountText) || null,
+        vatAmount: typeof extraction.vatAmount === "number" ? extraction.vatAmount : null,
+        vatText: normalizeOptionalString(extraction.vatText) || null,
+        dateISO: normalizeOptionalString(extraction.dateISO) || null,
+        dateText: normalizeOptionalString(extraction.dateText) || null,
+        invoiceNumber: normalizeOptionalString(extraction.invoiceNumber) || null,
+        paymentMethod: normalizeOptionalString(extraction.paymentMethod) || null,
+        category: normalizeOptionalString(extraction.category) || null,
+        suggestedTitle: normalizeOptionalString(extraction.suggestedTitle) || "Receipt",
+        shortDescription: normalizeOptionalString(extraction.shortDescription) || "Receipt extracted and ready to review.",
+        longDescription: normalizeOptionalString(extraction.longDescription) || "Receipt extracted and ready for review.",
+        lineItems: Array.isArray(extraction.lineItems)
+            ? extraction.lineItems
+                .filter((item) => item && typeof item === "object")
+                .map((item) => ({
+                    name: normalizeOptionalString(item.name) || "Item",
+                    quantity: normalizeOptionalString(item.quantity) || null,
+                    amountText: normalizeOptionalString(item.amountText) || null
+                }))
+                .filter((item) => item.name && item.name.length > 1)
+            : [],
+        extractedLines: Array.isArray(extraction.extractedLines)
+            ? extraction.extractedLines
+                .filter((line) => typeof line === "string")
+                .map((line) => normalizeOptionalString(line))
+                .filter(Boolean)
+            : [],
+        summary: normalizeOptionalString(extraction.summary) || "Receipt ready for review.",
+        needsReview: Boolean(extraction.needsReview),
+        extractionConfidence: clampConfidence(extraction.extractionConfidence)
+    };
+}
                     },
                     required: [
                         "recognizedText",
