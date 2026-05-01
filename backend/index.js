@@ -1552,6 +1552,10 @@ async function xeroGetJSON(url, { accessToken, tenantId }) {
     return data;
 }
 
+// =========================
+// XERO MATCHING
+// =========================
+
 async function findMatchingXeroTransactions({ accessToken, tenantId, document }) {
     const merchant = normalizeOptionalString(document.merchant);
     const totalAmount = coerceNumber(document.totalAmount ?? parseAmountText(document.totalText));
@@ -1589,7 +1593,7 @@ async function findMatchingXeroTransactions({ accessToken, tenantId, document })
         }))
         : [];
 
-    return [...invoiceMatches, ...bankMatches]
+    return [...invoiceMatches, ...bankMatches)
         .map((candidate) => scoreTransactionMatch(candidate, {
             merchant,
             totalAmount,
@@ -1696,6 +1700,42 @@ function formatCurrency(value) {
     }).format(value);
 }
 
+// New helpers to infer previous supplier coding from Xero
+async function findPreviousSupplierCoding({ accessToken, tenantId, supplierName }) {
+    const data = await xeroGetJSON(XERO_INVOICES_URL, {
+        accessToken,
+        tenantId
+    });
+    const invoices = Array.isArray(data?.Invoices) ? data.Invoices : [];
+    const matchingBills = invoices.filter((invoice) => {
+        return normalizeComparableText(invoice.Contact?.Name)
+            .includes(normalizeComparableText(supplierName));
+    });
+    const accountCodes = [];
+    for (const bill of matchingBills) {
+        for (const line of bill.LineItems || []) {
+            if (line.AccountCode) {
+                accountCodes.push({
+                    accountCode: line.AccountCode,
+                    description: line.Description || "",
+                    taxType: line.TaxType || ""
+                });
+            }
+        }
+    }
+    return accountCodes;
+}
+
+function pickMostCommonAccountCode(previousCoding) {
+    const counts = new Map();
+    for (const item of previousCoding) {
+        if (!item.accountCode) continue;
+        counts.set(item.accountCode, (counts.get(item.accountCode) || 0) + 1);
+    }
+    return [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+}
+
 function pickDocumentDate(extractedDocuments) {
     const candidates = Array.isArray(extractedDocuments) ? extractedDocuments : [];
 
@@ -1708,7 +1748,8 @@ function pickDocumentDate(extractedDocuments) {
     return new Date().toISOString().slice(0, 10);
 }
 
-function buildBillLineItems(metadata) {
+// buildBillLineItems is now async to allow Xero lookups for historical coding
+async function buildBillLineItems(metadata) {
     const extractedDocuments = Array.isArray(metadata.extractedDocuments)
         ? metadata.extractedDocuments
         : [];
@@ -1720,6 +1761,14 @@ function buildBillLineItems(metadata) {
     const lineItems = [];
 
     for (const document of extractedDocuments) {
+        // Suggest a code from historical supplier coding in Xero (if available)
+        const previousCoding = await findPreviousSupplierCoding({
+            accessToken: metadata.accessToken,
+            tenantId: metadata.tenantId,
+            supplierName: document.merchant
+        });
+        const suggestedCode = pickMostCommonAccountCode(previousCoding);
+
         const documentLineItems = Array.isArray(document?.lineItems) ? document.lineItems : [];
         const lineItemCode = normalizeOptionalString(document?.nominalCode || document?.accountCode);
         const fallbackTaxType = normalizeOptionalString(document?.taxType);
@@ -1739,7 +1788,7 @@ function buildBillLineItems(metadata) {
                     Description: String(item?.name || "Receipt line item").slice(0, 4000),
                     Quantity: Number(normalizeOptionalString(item?.quantity).replace(/[^0-9.-]/g, "")) || 1,
                     UnitAmount: Number.isFinite(parsedAmount) && parsedAmount !== 0 ? parsedAmount : undefined,
-                    AccountCode: code || undefined,
+                    AccountCode: code || suggestedCode || undefined,
                     TaxType: taxType || undefined
                 }));
             }
@@ -1762,7 +1811,7 @@ function buildBillLineItems(metadata) {
                 Description: description.slice(0, 4000),
                 Quantity: 1,
                 UnitAmount: Number.isFinite(parsedTotal) && parsedTotal > 0 ? parsedTotal : undefined,
-                AccountCode: code || undefined,
+                AccountCode: code || suggestedCode || undefined,
                 TaxType: taxType || undefined
             }));
         }
@@ -1800,7 +1849,7 @@ function compactObject(value) {
     );
 }
 
-function buildXeroDocumentPayload(metadata) {
+async function buildXeroDocumentPayload(metadata) {
     const extractedDocuments = Array.isArray(metadata.extractedDocuments)
         ? metadata.extractedDocuments
         : [];
@@ -1834,7 +1883,7 @@ function buildXeroDocumentPayload(metadata) {
         LineAmountTypes: normalizeOptionalString(metadata.lineAmountTypes) || "Inclusive",
         Reference: `${normalizeOptionalString(metadata.clientId)} ${referenceBase}`.trim().slice(0, 255),
         InvoiceNumber: referenceBase.slice(0, 255),
-        LineItems: buildBillLineItems(metadata)
+        LineItems: await buildBillLineItems(metadata)
     };
 }
 
@@ -1869,10 +1918,13 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
 
     const metadataWithAccounts = {
         ...metadata,
-        chartOfAccounts: connection.chartOfAccounts || []
+        chartOfAccounts: connection.chartOfAccounts || [],
+        // Provide access/tenant for historical coding lookups
+        accessToken: connection.accessToken,
+        tenantId: connection.selectedTenantId
     };
 
-    const xeroPayload = buildXeroDocumentPayload(metadataWithAccounts);
+    const xeroPayload = await buildXeroDocumentPayload(metadataWithAccounts);
     const documentType = normalizeOptionalString(metadata.documentType) === "sales"
         ? "sales"
         : "purchase";
@@ -1975,16 +2027,16 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         text: [
                             "You extract fields from receipts and invoices.",
                             "Read the document image carefully and return only the structured JSON requested.",
-                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice.",
+                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."[...]
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
-                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine text.",
+                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine t[...]
                             "If a PDF is supplied, it has been converted to an image preview of its first page before analysis.",
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses in the title.",
-                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or invoice details."
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses [...]
+                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or in[...]
                         ].join(" ")
                     }
                 ]
@@ -1995,7 +2047,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                     {
                         type: "input_text",
                         text: [
-                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longer description.",
+                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longe[...]
                             "Return titleVendor as the best vendor name for naming the document, and titleAmountText as the best final paid amount text for naming the document.",
                             capturedAt ? `If the document date is unreadable, you may use this fallback capture timestamp: ${capturedAt}.` : "",
                             "Recognized text should contain the important visible text from the document.",
