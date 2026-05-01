@@ -1,6 +1,7 @@
 import crypto from "crypto";
+import fs from "fs/promises";
 import path from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 import dotenv from "dotenv";
 import express from "express";
@@ -182,12 +183,109 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
+function apiKeys() {
+    return String(process.env.JENTRY_SERVER_API_KEYS || process.env.JENTRY_API_TOKEN || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+}
+
+function secureCompare(lhs, rhs) {
+    const left = Buffer.from(String(lhs));
+    const right = Buffer.from(String(rhs));
+    return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requestAPIKey(request) {
+    const authorizationHeader = normalizeOptionalString(request.get("authorization"));
+    if (authorizationHeader.toLowerCase().startsWith("bearer ")) {
+        return authorizationHeader.slice(7).trim();
+    }
+
+    return normalizeOptionalString(request.get("x-jentry-api-key"));
+}
+
+function requireAuthenticatedRequest(request, response, next) {
+    const configuredAPIKeys = apiKeys();
+    if (configuredAPIKeys.length === 0) {
+        response.status(503).json({ message: "Backend API authentication is not configured." });
+        return;
+    }
+
+    const suppliedAPIKey = requestAPIKey(request);
+    const isAuthorized = configuredAPIKeys.some((candidate) => secureCompare(candidate, suppliedAPIKey));
+    if (!isAuthorized) {
+        response.status(401).json({ message: "Unauthorized." });
+        return;
+    }
+
+    next();
+}
+
+function allowedReturnURIs() {
+    const configuredURIs = String(process.env.JENTRY_ALLOWED_RETURN_URIS || "")
+        .split(",")
+        .map((value) => normalizeAbsoluteURL(value))
+        .filter(Boolean);
+    return new Set([xeroAppRedirectURI(), ...configuredURIs]);
+}
+
+function sanitizeReturnURI(value) {
+    const normalizedValue = normalizeAbsoluteURL(value);
+    if (!normalizedValue || !allowedReturnURIs().has(normalizedValue)) {
+        return xeroAppRedirectURI();
+    }
+
+    return normalizedValue;
+}
+
+function allowedUploadRecipientDomains() {
+    const configuredDomains = String(process.env.JENTRY_ALLOWED_UPLOAD_RECIPIENT_DOMAINS || "xerofiles.com")
+        .split(",")
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean);
+    return new Set(configuredDomains);
+}
+
+function allowedUploadRecipients() {
+    return new Set(
+        String(process.env.JENTRY_ALLOWED_UPLOAD_RECIPIENTS || "")
+            .split(",")
+            .map((value) => normalizeEmail(value).toLowerCase())
+            .filter(Boolean)
+    );
+}
+
+function assertAllowedUploadRecipient(value) {
+    const normalizedRecipient = normalizeEmail(value).toLowerCase();
+    if (!normalizedRecipient) {
+        throw new Error("Missing deliveryTo in metadata.");
+    }
+
+    const explicitRecipients = allowedUploadRecipients();
+    if (explicitRecipients.has(normalizedRecipient)) {
+        return normalizedRecipient;
+    }
+
+    const [, domain = ""] = normalizedRecipient.split("@");
+    if (!allowedUploadRecipientDomains().has(domain)) {
+        throw new Error("That upload recipient is not allowed by the backend.");
+    }
+
+    return normalizedRecipient;
+}
+
+function problemReportRecipient() {
+    return normalizeEmail(process.env.JENTRY_PROBLEM_REPORT_TO || "jay@jaccountancy.co.uk");
+}
+
+
 app.get("/health", (_request, response) => {
     console.log("Health check received.");
     response.json({ ok: true });
 });
 
-app.get("/oauth/xero/start", async (request, response) => {
+app.get("/oauth/xero/start", requireAuthenticatedRequest, async (request, response) => {
     try {
         if (!xeroConfigured()) {
             response.status(500).json({ message: "Xero OAuth is not configured on the backend." });
@@ -200,7 +298,7 @@ app.get("/oauth/xero/start", async (request, response) => {
             return;
         }
 
-        const returnUri = normalizeOptionalString(request.query.returnUri) || xeroAppRedirectURI();
+        const returnUri = sanitizeReturnURI(request.query.returnUri);
         const { verifier, challenge } = createPKCEPair();
         const state = crypto.randomUUID();
 
@@ -324,7 +422,7 @@ app.get("/oauth/xero/callback", async (request, response) => {
     }
 });
 
-app.get("/xero/status", async (request, response) => {
+app.get("/xero/status", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
         if (!accountId) {
@@ -356,7 +454,7 @@ app.get("/xero/status", async (request, response) => {
     }
 });
 
-app.get("/xero/tenants", async (request, response) => {
+app.get("/xero/tenants", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
         if (!accountId) {
@@ -376,7 +474,7 @@ app.get("/xero/tenants", async (request, response) => {
     }
 });
 
-app.post("/xero/select-tenant", async (request, response) => {
+app.post("/xero/select-tenant", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId);
         const tenantId = normalizeOptionalString(request.body?.tenantId);
@@ -414,7 +512,7 @@ app.post("/xero/select-tenant", async (request, response) => {
     }
 });
 
-app.post("/xero/disconnect", async (request, response) => {
+app.post("/xero/disconnect", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId);
         if (!accountId) {
@@ -429,7 +527,7 @@ app.post("/xero/disconnect", async (request, response) => {
     }
 });
 
-app.get("/xero/accounts", async (request, response) => {
+app.get("/xero/accounts", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
         if (!accountId) {
@@ -462,7 +560,7 @@ app.get("/xero/accounts", async (request, response) => {
     }
 });
 
-app.post("/xero/match-transactions", async (request, response) => {
+app.post("/xero/match-transactions", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId);
         const document = request.body?.document;
@@ -500,7 +598,7 @@ app.post("/xero/match-transactions", async (request, response) => {
     }
 });
 
-app.post("/xero/publish-bill", upload.any(), async (request, response) => {
+app.post("/xero/publish-bill", requireAuthenticatedRequest, upload.any(), async (request, response) => {
     try {
         const metadataFile = Array.isArray(request.files)
             ? request.files.find((file) => file.fieldname === "metadata")
@@ -544,6 +642,7 @@ app.post("/xero/publish-bill", upload.any(), async (request, response) => {
 
 app.post(
     "/jentry/uploads",
+    requireAuthenticatedRequest,
     upload.fields([
         { name: "metadata", maxCount: 1 },
         { name: "documents[]", maxCount: 50 }
@@ -610,12 +709,13 @@ app.post(
 );
 
 for (const analyzePath of ["/analyze", "/jentry/analyze"]) {
-    app.post(analyzePath, upload.single("document"), analyzeHandler);
+    app.post(analyzePath, requireAuthenticatedRequest, upload.single("document"), analyzeHandler);
 }
 
 for (const reportPath of ["/problem-report", "/jentry/problem-report"]) {
     app.post(
         reportPath,
+        requireAuthenticatedRequest,
         upload.fields([
             { name: "metadata", maxCount: 1 },
             { name: "attachments[]", maxCount: 50 }
@@ -624,7 +724,7 @@ for (const reportPath of ["/problem-report", "/jentry/problem-report"]) {
     );
 }
 
-app.post("/jentry/inbox/register", async (request, response) => {
+app.post("/jentry/inbox/register", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId);
         const clientId = normalizeOptionalString(request.body?.clientId);
@@ -659,7 +759,7 @@ app.post("/jentry/inbox/register", async (request, response) => {
     }
 });
 
-app.get("/inbound-email-submissions", async (request, response) => {
+app.get("/inbound-email-submissions", requireAuthenticatedRequest, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.query.accountId);
         const inboxEmail = normalizeEmail(request.query.inboxEmail);
@@ -793,7 +893,7 @@ app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, r
     }
 });
 
-app.get("/xero/contacts", async (req, res) => {
+app.get("/xero/contacts", requireAuthenticatedRequest, async (req, res) => {
     try {
         const accountId = normalizeOptionalString(req.query.accountId);
         if (!accountId) {
@@ -827,7 +927,7 @@ app.get("/xero/contacts", async (req, res) => {
     }
 });
 
-app.post("/xero/ensure-contact", async (req, res) => {
+app.post("/xero/ensure-contact", requireAuthenticatedRequest, async (req, res) => {
     try {
         const accountId = normalizeOptionalString(req.body?.accountId);
         const contactName = normalizeOptionalString(req.body?.contactName);
@@ -890,7 +990,8 @@ app.use((request, response) => {
     response.status(404).send(`Cannot ${request.method} ${request.path}`);
 });
 
-app.listen(port, () => {
+function startServer() {
+    return app.listen(port, () => {
     console.log(`Jentry relay listening on port ${port}`);
     console.log(JSON.stringify({
         routes: [
@@ -917,6 +1018,15 @@ app.listen(port, () => {
         ]
     }));
 });
+}
+
+function isExecutedDirectly() {
+    return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+}
+
+if (isExecutedDirectly()) {
+    startServer();
+}
 
 async function analyzeHandler(request, response) {
     try {
@@ -932,16 +1042,34 @@ async function analyzeHandler(request, response) {
         }
 
         const capturedAt = normalizeOptionalString(request.body?.capturedAt);
+        const analysisContext = parseJSONField(request.body?.analysisContext, null);
+        console.log("Receipt analysis request received.", {
+            contentType: request.headers["content-type"] || "unknown",
+            mimeType: documentFile.mimetype || "unknown",
+            size: documentFile.size || documentFile.buffer.length,
+            hasAnalysisContext: Boolean(analysisContext)
+        });
 
         const extraction = await analyzeReceiptWithOpenAI({
             buffer: documentFile.buffer,
             mimeType: documentFile.mimetype || "image/jpeg",
-            capturedAt
+            capturedAt,
+            analysisContext
+        });
+
+        console.log("Receipt analysis completed.", {
+            merchant: extraction.merchant || "unknown",
+            totalText: extraction.totalText || "unknown",
+            needsReview: extraction.needsReview
         });
 
         response.json(extraction);
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown analysis error.";
+        console.error("Receipt analysis failed.", {
+            message,
+            stack: error instanceof Error ? error.stack : undefined
+        });
         response.status(500).json({ message });
     }
 }
@@ -958,8 +1086,8 @@ async function problemReportHandler(request, response) {
 
         const metadata = JSON.parse(metadataText);
 
-        const to = normalizeEmail(metadata.to) || "jay@jaccountancy.co.uk";
-        const from = normalizeEmail(process.env.GMAIL_SENDER);
+        const to = problemReportRecipient();
+        const from = getSenderEmail();
         const subject = normalizeOptionalString(metadata.subject) || "Jentry problem report";
         const body = normalizeOptionalString(metadata.body) || "A problem report was sent from Jentry.";
 
@@ -1678,6 +1806,46 @@ async function refreshXeroConnection(accountId, connection) {
     });
 }
 
+function xeroDateTimeLiteral(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+        return "";
+    }
+
+    return `DateTime(${date.getUTCFullYear()},${date.getUTCMonth() + 1},${date.getUTCDate()})`;
+}
+
+function xeroDateRangeWhereClause(dateISO, fieldName = "Date", windowDays = 14) {
+    const normalizedDate = normalizeOptionalString(dateISO);
+    if (!normalizedDate) {
+        return "";
+    }
+
+    const centerDate = new Date(normalizedDate);
+    if (Number.isNaN(centerDate.getTime())) {
+        return "";
+    }
+
+    const startDate = new Date(centerDate);
+    startDate.setUTCDate(startDate.getUTCDate() - windowDays);
+
+    const endDate = new Date(centerDate);
+    endDate.setUTCDate(endDate.getUTCDate() + windowDays);
+
+    return `${fieldName}>=${xeroDateTimeLiteral(startDate)}&&${fieldName}<=${xeroDateTimeLiteral(endDate)}`;
+}
+
+function appendXeroQueryParameters(url, parameters) {
+    const target = new URL(url);
+    for (const [key, value] of Object.entries(parameters)) {
+        const normalizedValue = normalizeOptionalString(value);
+        if (normalizedValue) {
+            target.searchParams.set(key, normalizedValue);
+        }
+    }
+    return target.toString();
+}
+
 async function xeroGetJSON(url, { accessToken, tenantId }) {
     const response = await fetch(url, {
         headers: {
@@ -2366,14 +2534,10 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
 }
 
 async function handleEmailUpload(metadata, documentFiles) {
-    const to = normalizeEmail(metadata.deliveryTo);
+    const to = assertAllowedUploadRecipient(metadata.deliveryTo);
     const from = normalizeEmail(metadata.preferredFromEmail) || getSenderEmail();
     const subject = String(metadata.deliverySubject || "Jentry submission");
     const body = String(metadata.deliveryBody || "");
-
-    if (!to) {
-        throw new Error("Missing deliveryTo in metadata.");
-    }
 
     if (documentFiles.length === 0) {
         throw new Error("No documents were uploaded.");
@@ -2404,7 +2568,7 @@ async function handleEmailUpload(metadata, documentFiles) {
     };
 }
 
-async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
+async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysisContext = null }) {
     const { originalImageDataURL, enhancedImageDataURL } = await buildReceiptAnalysisImages({ buffer, mimeType });
 
     const body = {
@@ -2600,6 +2764,43 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
     };
 }
 
+function buildXeroCodingInstructions(analysisContext) {
+    const chartOfAccounts = Array.isArray(analysisContext?.chartOfAccounts)
+        ? analysisContext.chartOfAccounts
+        : [];
+
+    if (chartOfAccounts.length === 0) {
+        return {
+            systemInstruction: "If Xero coding context is not provided, leave nominal-code and tax fields null unless the document explicitly states them.",
+            userInstruction: "If no Xero chart of accounts is provided, return null for selectedNominalCode, selectedNominalCodeName, selectedTaxType, and leave line-level coding fields null unless clearly stated on the document."
+        };
+    }
+
+    const allowedAccounts = chartOfAccounts
+        .slice(0, 250)
+        .map((account) => compactObject({
+            code: normalizeOptionalString(account.code),
+            name: normalizeOptionalString(account.name),
+            type: normalizeOptionalString(account.type) || null,
+            classType: normalizeOptionalString(account.classType) || null,
+            taxType: normalizeOptionalString(account.taxType) || null
+        }))
+        .filter((account) => account.code && account.name);
+
+    const accountListJSON = JSON.stringify(allowedAccounts);
+    return {
+        systemInstruction: "When Xero chart-of-accounts context is supplied, choose the best matching nominal code from that list using the merchant, line descriptions, invoice context, and normal bookkeeping intent. Do not invent codes. Prefer the most specific valid expense account and carry the account default tax type where appropriate.",
+        userInstruction: [
+            "Use the supplied Xero chart of accounts to choose document-level and line-level coding.",
+            "Return selectedNominalCode and selectedNominalCodeName using only one of the supplied accounts.",
+            "Return selectedTaxType using the chosen account default tax type when appropriate, or another clearly better tax type if the document evidence supports it.",
+            "For each line item, return nominalCode, nominalCodeName, taxType, taxRateText, codingReasoning, codingConfidence, and requiresReview.",
+            "If a line item is too ambiguous, leave the coding fields null, set requiresReview to true, and explain why in codingReasoning.",
+            `Allowed Xero accounts: ${accountListJSON}`
+        ].join(" ")
+    };
+}
+
 async function buildReceiptAnalysisImages({ buffer, mimeType }) {
     const normalizedMimeType = normalizeOptionalString(mimeType) || "image/jpeg";
     const isPDF = normalizedMimeType === "application/pdf";
@@ -2726,3 +2927,16 @@ async function buildRawMessage({ from, to, subject, body, attachments }) {
         .replace(/\//g, "_")
         .replace(/=+$/g, "");
 }
+
+
+export {
+    app,
+    assertAllowedUploadRecipient,
+    buildReturnURL,
+    findMatchingXeroTransactions,
+    problemReportRecipient,
+    requireAuthenticatedRequest,
+    sanitizeReturnURI,
+    startServer,
+    xeroDateRangeWhereClause
+};
