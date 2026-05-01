@@ -18,7 +18,7 @@ const __dirname = path.dirname(__filename);
 const requiredEnvironmentVariables = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
-    "GOOGLE_REFRESH_TOKEN",
+    "GOOGLE_REFRESH_TOKEN",a
     "GMAIL_SENDER"
 ];
 
@@ -67,7 +67,115 @@ const XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices";
 const XERO_ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts";
 const XERO_BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions";
 const XERO_CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts";
-const xeroAuthSessions = new Map();
+
+
+class XeroAPIError extends Error {
+    constructor({ message, code = "XERO_UPSTREAM_ERROR", status = 502, requiresReconnect = false, upstreamStatus = null, upstreamBody = null } = {}) {
+        super(message || "Xero request failed.");
+        this.name = "XeroAPIError";
+        this.code = code;
+        this.status = status;
+        this.requiresReconnect = requiresReconnect;
+        this.upstreamStatus = upstreamStatus;
+        this.upstreamBody = upstreamBody;
+    }
+}
+
+function xeroErrorResponse(error, fallbackMessage = "Xero request failed.") {
+    if (error instanceof XeroAPIError) {
+        return {
+            status: error.status,
+            body: compactObject({
+                code: error.code,
+                message: error.message,
+                requiresReconnect: error.requiresReconnect,
+                upstreamStatus: error.upstreamStatus,
+                upstreamBody: error.upstreamBody
+            })
+        };
+    }
+
+    return {
+        status: 500,
+        body: {
+            code: "XERO_BACKEND_ERROR",
+            message: error instanceof Error ? error.message : fallbackMessage,
+            requiresReconnect: false
+        }
+    };
+}
+
+function sendXeroError(response, error, fallbackMessage = "Xero request failed.") {
+    const normalized = xeroErrorResponse(error, fallbackMessage);
+    response.status(normalized.status).json(normalized.body);
+}
+
+async function readXeroResponse(response) {
+    const text = await response.text().catch(() => "");
+    if (!text) return { raw: "", data: null };
+
+    try {
+        return { raw: text, data: JSON.parse(text) };
+    } catch {
+        return { raw: text, data: null };
+    }
+}
+
+function isXeroAuthStatus(status) {
+    return status === 401 || status === 403;
+}
+
+function classifyXeroError(status, body, fallbackMessage = "Xero request failed.") {
+    const message =
+        body?.error_description ||
+        body?.error ||
+        body?.Message ||
+        body?.Detail ||
+        body?.Elements?.[0]?.ValidationErrors?.map((entry) => entry.Message).join("; ") ||
+        fallbackMessage;
+
+    if (status === 401) {
+        return new XeroAPIError({
+            message: "Xero authorization expired.",
+            code: "XERO_AUTH_EXPIRED",
+            status: 401,
+            requiresReconnect: true,
+            upstreamStatus: status,
+            upstreamBody: body
+        });
+    }
+
+    if (status === 403) {
+        return new XeroAPIError({
+            message: message || "Xero tenant access was denied.",
+            code: "XERO_TENANT_ACCESS_DENIED",
+            status: 403,
+            requiresReconnect: false,
+            upstreamStatus: status,
+            upstreamBody: body
+        });
+    }
+
+    if (status === 409) {
+        return new XeroAPIError({
+            message,
+            code: "XERO_DUPLICATE_OR_CONFLICT",
+            status: 409,
+            requiresReconnect: false,
+            upstreamStatus: status,
+            upstreamBody: body
+        });
+    }
+
+    return new XeroAPIError({
+        message,
+        code: status >= 500 ? "XERO_UPSTREAM_UNAVAILABLE" : "XERO_UPSTREAM_ERROR",
+        status: status >= 500 ? 503 : 502,
+        requiresReconnect: isXeroAuthStatus(status),
+        upstreamStatus: status,
+        upstreamBody: body
+    });
+}
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -96,11 +204,11 @@ app.get("/oauth/xero/start", async (request, response) => {
         const { verifier, challenge } = createPKCEPair();
         const state = crypto.randomUUID();
 
-        xeroAuthSessions.set(state, {
+        await createXeroAuthSession({
+            state,
             accountId,
             returnUri,
-            verifier,
-            createdAt: Date.now()
+            verifier
         });
 
         const authorizeURL = new URL(XERO_AUTHORIZE_URL);
@@ -121,10 +229,12 @@ app.get("/oauth/xero/start", async (request, response) => {
 
 app.get("/oauth/xero/callback", async (request, response) => {
     const state = normalizeOptionalString(request.query.state);
-    const authSession = xeroAuthSessions.get(state);
-    const fallbackReturnURL = authSession?.returnUri || xeroAppRedirectURI();
+    let authSession = null;
+    let fallbackReturnURL = xeroAppRedirectURI();
 
     try {
+        authSession = state ? await getXeroAuthSession(state) : null;
+        fallbackReturnURL = authSession?.returnUri || xeroAppRedirectURI();
         if (!authSession) {
             response.redirect(
                 buildReturnURL(fallbackReturnURL, {
@@ -135,7 +245,7 @@ app.get("/oauth/xero/callback", async (request, response) => {
             return;
         }
 
-        xeroAuthSessions.delete(state);
+        await deleteXeroAuthSession(state);
 
         const authError = normalizeOptionalString(request.query.error);
         if (authError) {
@@ -233,20 +343,16 @@ app.get("/xero/status", async (request, response) => {
             tenants: connection.tenants || [],
             connectedAt: connection.connectedAt || null,
             expiresAt: connection.expiresAt || null,
+            tokenValid: true,
+            tenantSelected: Boolean(connection.selectedTenantId),
+            accountsSynced: Array.isArray(connection.chartOfAccounts) && connection.chartOfAccounts.length > 0,
+            contactsSynced: Boolean(connection.contactsLastSyncedAt),
             chartOfAccountsLastSyncedAt: connection.chartOfAccountsLastSyncedAt || null,
+            contactsLastSyncedAt: connection.contactsLastSyncedAt || null,
             chartOfAccountsCount: Array.isArray(connection.chartOfAccounts) ? connection.chartOfAccounts.length : 0
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to fetch Xero status.";
-response.status(200).json({
-    isConnected: false,
-    requiresReconnect:
-        message.includes("No Xero connection") ||
-        message.includes("cannot be refreshed") ||
-        message.includes("invalid_grant"),
-    connectedUserEmail: null,
-    message
-});
+        sendXeroError(response, error, "Unable to fetch Xero status.");
     }
 });
 
@@ -266,8 +372,7 @@ app.get("/xero/tenants", async (request, response) => {
             connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to load Xero organisations.";
-        response.status(500).json({ message });
+        sendXeroError(response, error);
     }
 });
 
@@ -305,8 +410,7 @@ app.post("/xero/select-tenant", async (request, response) => {
             chartOfAccountsCount: updated.chartOfAccounts.length
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to select Xero organisation.";
-        response.status(500).json({ message });
+        sendXeroError(response, error);
     }
 });
 
@@ -321,8 +425,7 @@ app.post("/xero/disconnect", async (request, response) => {
         await deleteXeroConnection(accountId);
         response.json({ disconnected: true, connectedUserEmail: null });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to disconnect Xero.";
-        response.status(500).json({ message });
+        sendXeroError(response, error);
     }
 });
 
@@ -337,7 +440,7 @@ app.get("/xero/accounts", async (request, response) => {
         const connection = await ensureFreshXeroConnection(accountId);
         const tenantId = normalizeOptionalString(request.query.tenantId) || connection.selectedTenantId;
         if (!tenantId) {
-            response.status(400).json({ message: "No Xero organisation has been selected for this account." });
+            sendXeroError(response, new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
             return;
         }
 
@@ -355,8 +458,7 @@ app.get("/xero/accounts", async (request, response) => {
             connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to sync Xero chart of accounts.";
-        response.status(500).json({ message });
+        sendXeroError(response, error);
     }
 });
 
@@ -377,7 +479,7 @@ app.post("/xero/match-transactions", async (request, response) => {
 
         const connection = await ensureFreshXeroConnection(accountId);
         if (!connection.selectedTenantId) {
-            response.status(400).json({ message: "No Xero organisation has been selected for this account." });
+            sendXeroError(response, new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
             return;
         }
 
@@ -394,8 +496,7 @@ app.post("/xero/match-transactions", async (request, response) => {
             connectedUserEmail: connection.connectedUserEmail || null
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to match transactions in Xero.";
-        response.status(500).json({ message });
+        sendXeroError(response, error);
     }
 });
 
@@ -427,13 +528,17 @@ app.post("/xero/publish-bill", upload.any(), async (request, response) => {
         response.json({
             submissionId: metadata.submissionId || result.remoteSubmissionID,
             remoteSubmissionID: result.remoteSubmissionID,
+            invoiceId: result.invoiceId,
+            published: result.published,
+            idempotent: result.idempotent || false,
+            attachmentsUploaded: result.attachmentsUploaded,
+            warning: result.warning || null,
             message: result.confirmationMessage,
             tenantName: connection?.selectedTenantName || null,
             connectedUserEmail: connection?.connectedUserEmail || null
         });
     } catch (error) {
-        const message = error instanceof Error ? error.message : "Unable to publish bill to Xero.";
-        response.status(500).json({ message });
+        sendXeroError(response, error, "Unable to publish bill to Xero.");
     }
 });
 
@@ -477,7 +582,12 @@ app.post(
                 response.json({
                     submissionId: metadata.submissionId || result.remoteSubmissionID,
                     message: result.confirmationMessage,
-                    remoteSubmissionID: result.remoteSubmissionID
+                    remoteSubmissionID: result.remoteSubmissionID,
+                    invoiceId: result.invoiceId,
+                    published: result.published,
+                    idempotent: result.idempotent || false,
+                    attachmentsUploaded: result.attachmentsUploaded,
+                    warning: result.warning || null
                 });
                 return;
             }
@@ -490,6 +600,10 @@ app.post(
                 message,
                 stack: error instanceof Error ? error.stack : undefined
             });
+            if (error instanceof XeroAPIError) {
+                sendXeroError(response, error, message);
+                return;
+            }
             response.status(500).json({ message });
         }
     }
@@ -689,7 +803,7 @@ app.get("/xero/contacts", async (req, res) => {
 
         const connection = await ensureFreshXeroConnection(accountId);
         if (!connection.selectedTenantId) {
-            res.status(400).json({ message: "No Xero tenant selected." });
+            sendXeroError(res, new XeroAPIError({ message: "No Xero tenant selected.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
             return;
         }
 
@@ -698,13 +812,18 @@ app.get("/xero/contacts", async (req, res) => {
             tenantId: connection.selectedTenantId
         });
 
+        await upsertXeroConnection(accountId, (previous) => ({
+            ...previous,
+            contactsLastSyncedAt: new Date().toISOString()
+        }));
+
         res.json({
-            contacts: Array.isArray(data?.Contacts) ? data.Contacts : []
+            contacts: Array.isArray(data?.Contacts) ? data.Contacts : [],
+            contactsSynced: true,
+            contactsLastSyncedAt: new Date().toISOString()
         });
     } catch (error) {
-        res.status(500).json({
-            message: error instanceof Error ? error.message : "Unable to load Xero contacts."
-        });
+        sendXeroError(res, error, "Unable to load Xero contacts.");
     }
 });
 
@@ -720,7 +839,7 @@ app.post("/xero/ensure-contact", async (req, res) => {
 
         const connection = await ensureFreshXeroConnection(accountId);
         if (!connection.selectedTenantId) {
-            res.status(400).json({ message: "No Xero tenant selected." });
+            sendXeroError(res, new XeroAPIError({ message: "No Xero tenant selected.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
             return;
         }
 
@@ -763,9 +882,7 @@ app.post("/xero/ensure-contact", async (req, res) => {
             created: true
         });
     } catch (error) {
-        res.status(500).json({
-            message: error instanceof Error ? error.message : "Unable to ensure contact in Xero."
-        });
+        sendXeroError(res, error, "Unable to ensure contact in Xero.");
     }
 });
 
@@ -1394,13 +1511,24 @@ async function exchangeXeroToken(params) {
         body
     });
 
-    const data = await response.json().catch(() => ({}));
+    const { data, raw } = await readXeroResponse(response);
 
     if (!response.ok) {
-        throw new Error(data.error_description || data.error || "Xero token exchange failed.");
+        const error = classifyXeroError(response.status, data || raw, "Xero token exchange failed.");
+        if (response.status === 400 || data?.error === "invalid_grant") {
+            throw new XeroAPIError({
+                message: "Xero authorization expired.",
+                code: "XERO_AUTH_EXPIRED",
+                status: 401,
+                requiresReconnect: true,
+                upstreamStatus: response.status,
+                upstreamBody: data || raw
+            });
+        }
+        throw error;
     }
 
-    return data;
+    return data || {};
 }
 
 async function fetchXeroTenants(accessToken) {
@@ -1411,10 +1539,10 @@ async function fetchXeroTenants(accessToken) {
         }
     });
 
-    const data = await response.json().catch(() => []);
+    const { data, raw } = await readXeroResponse(response);
 
     if (!response.ok) {
-        throw new Error("Failed to fetch Xero organisations.");
+        throw classifyXeroError(response.status, data || raw, "Failed to fetch Xero organisations.");
     }
 
     return sanitizeTenants(data);
@@ -1444,10 +1572,10 @@ async function fetchChartOfAccounts(accessToken, tenantId) {
         }
     });
 
-    const data = await response.json().catch(() => ({}));
+    const { data, raw } = await readXeroResponse(response);
 
     if (!response.ok) {
-        throw new Error(data?.Message || "Failed to fetch Xero chart of accounts.");
+        throw classifyXeroError(response.status, data || raw, "Failed to fetch Xero chart of accounts.");
     }
 
     const accounts = Array.isArray(data?.Accounts) ? data.Accounts : [];
@@ -1475,7 +1603,12 @@ async function ensureFreshXeroConnection(accountId) {
     const connection = await getXeroConnection(accountId);
 
     if (!connection) {
-        throw new Error("No Xero connection found for this account.");
+        throw new XeroAPIError({
+            message: "No Xero connection found for this account.",
+            code: "XERO_NOT_CONNECTED",
+            status: 401,
+            requiresReconnect: true
+        });
     }
 
     if (tokenExpiresSoon(connection.expiresAt)) {
@@ -1485,14 +1618,22 @@ async function ensureFreshXeroConnection(accountId) {
     try {
         await fetchXeroTenants(connection.accessToken);
         return connection;
-    } catch {
+    } catch (error) {
+        if (error instanceof XeroAPIError && error.status === 403) {
+            throw error;
+        }
         return refreshXeroConnection(accountId, connection);
     }
 }
 
 async function refreshXeroConnection(accountId, connection) {
     if (!connection.refreshToken) {
-        throw new Error("Xero connection cannot be refreshed.");
+        throw new XeroAPIError({
+            message: "Xero authorization expired.",
+            code: "XERO_AUTH_EXPIRED",
+            status: 401,
+            requiresReconnect: true
+        });
     }
 
     const tokenData = await exchangeXeroToken({
@@ -1546,13 +1687,13 @@ async function xeroGetJSON(url, { accessToken, tenantId }) {
         }
     });
 
-    const data = await response.json().catch(() => ({}));
+    const { data, raw } = await readXeroResponse(response);
 
     if (!response.ok) {
-        throw new Error(data?.Message || "Xero request failed.");
+        throw classifyXeroError(response.status, data || raw, "Xero request failed.");
     }
 
-    return data;
+    return data || {};
 }
 
 // =========================
@@ -1846,6 +1987,147 @@ if (normalizeOptionalString(document.merchant)) {
     ];
 }
 
+function createPublishDocumentHash(documentFiles = []) {
+    const hash = crypto.createHash("sha256");
+    for (const file of documentFiles) {
+        hash.update(file.originalname || "");
+        hash.update(String(file.size || file.buffer?.length || 0));
+        if (file.buffer?.length) hash.update(file.buffer);
+    }
+    return hash.digest("hex");
+}
+
+async function ensureXeroAuthSessionsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS xero_auth_sessions (
+            state text PRIMARY KEY,
+            account_id text NOT NULL,
+            return_uri text NOT NULL,
+            verifier text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+}
+
+async function createXeroAuthSession({ state, accountId, returnUri, verifier }) {
+    await ensureXeroAuthSessionsTable();
+    await pool.query(
+        `
+        INSERT INTO xero_auth_sessions (state, account_id, return_uri, verifier, created_at)
+        VALUES ($1, $2, $3, $4, now())
+        `,
+        [state, accountId, returnUri, verifier]
+    );
+}
+
+async function getXeroAuthSession(state) {
+    await ensureXeroAuthSessionsTable();
+    await pool.query(`DELETE FROM xero_auth_sessions WHERE created_at < now() - interval '30 minutes'`);
+
+    const result = await pool.query(
+        `
+        SELECT state, account_id, return_uri, verifier, created_at
+        FROM xero_auth_sessions
+        WHERE state = $1
+        LIMIT 1
+        `,
+        [state]
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+        state: row.state,
+        accountId: row.account_id,
+        returnUri: row.return_uri,
+        verifier: row.verifier,
+        createdAt: row.created_at
+    };
+}
+
+async function deleteXeroAuthSession(state) {
+    if (!state) return;
+    await ensureXeroAuthSessionsTable();
+    await pool.query(`DELETE FROM xero_auth_sessions WHERE state = $1`, [state]);
+}
+
+async function ensureXeroPublishRecordsTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS xero_publish_records (
+            account_id text NOT NULL,
+            submission_id text NOT NULL,
+            document_hash text,
+            invoice_id text,
+            status text NOT NULL DEFAULT 'pending',
+            attachments_uploaded boolean,
+            warning text,
+            xero_invoice jsonb,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (account_id, submission_id)
+        )
+    `);
+}
+
+async function createXeroPublishRecord({ accountId, submissionId, documentHash, status }) {
+    await ensureXeroPublishRecordsTable();
+    await pool.query(
+        `
+        INSERT INTO xero_publish_records (account_id, submission_id, document_hash, status, updated_at)
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (account_id, submission_id)
+        DO UPDATE SET status = EXCLUDED.status,
+            document_hash = COALESCE(xero_publish_records.document_hash, EXCLUDED.document_hash),
+            warning = null,
+            updated_at = now()
+        `,
+        [accountId, submissionId, documentHash || null, status || "pending"]
+    );
+}
+
+async function getXeroPublishRecord({ accountId, submissionId }) {
+    await ensureXeroPublishRecordsTable();
+    const result = await pool.query(
+        `SELECT * FROM xero_publish_records WHERE account_id = $1 AND submission_id = $2 LIMIT 1`,
+        [accountId, submissionId]
+    );
+    return result.rows[0] || null;
+}
+
+async function updateXeroPublishRecord({
+    accountId,
+    submissionId,
+    invoiceId = null,
+    status,
+    attachmentsUploaded = null,
+    warning = null,
+    xeroInvoice = null
+}) {
+    await ensureXeroPublishRecordsTable();
+    await pool.query(
+        `
+        UPDATE xero_publish_records
+        SET invoice_id = COALESCE($3, invoice_id),
+            status = COALESCE($4, status),
+            attachments_uploaded = COALESCE($5, attachments_uploaded),
+            warning = $6,
+            xero_invoice = COALESCE($7::jsonb, xero_invoice),
+            updated_at = now()
+        WHERE account_id = $1 AND submission_id = $2
+        `,
+        [
+            accountId,
+            submissionId,
+            invoiceId,
+            status || null,
+            attachmentsUploaded,
+            warning,
+            xeroInvoice ? JSON.stringify(xeroInvoice) : null
+        ]
+    );
+}
+
 function inferTaxTypeFromDocument(document, chartOfAccounts, accountCode) {
     if (normalizeOptionalString(document?.vatText) || document?.vatAmount != null) {
         return "INPUT";
@@ -1918,16 +2200,65 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
     });
 
     if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Xero attachment upload failed: ${text || response.status}`);
+        const { data, raw } = await readXeroResponse(response);
+        throw classifyXeroError(response.status, data || raw, "Xero attachment upload failed.");
     }
 }
 
 async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
-    const connection = await ensureFreshXeroConnection(accountId);
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    const submissionId = normalizeOptionalString(metadata.submissionId || metadata.submissionID);
+    const documentHash = createPublishDocumentHash(documentFiles);
+
+    if (submissionId) {
+        const existingPublish = await getXeroPublishRecord({
+            accountId: normalizedAccountId,
+            submissionId
+        });
+
+        if (existingPublish?.invoice_id) {
+            return {
+                remoteSubmissionID: existingPublish.invoice_id,
+                invoiceId: existingPublish.invoice_id,
+                confirmationMessage: existingPublish.warning || "This submission has already been published to Xero.",
+                published: true,
+                idempotent: true,
+                attachmentsUploaded: existingPublish.attachments_uploaded !== false,
+                warning: existingPublish.warning || null,
+                invoice: existingPublish.xero_invoice || null
+            };
+        }
+
+        if (existingPublish?.document_hash && existingPublish.document_hash !== documentHash) {
+            throw new XeroAPIError({
+                message: "A different document payload already exists for this submissionId.",
+                code: "XERO_PUBLISH_IDEMPOTENCY_CONFLICT",
+                status: 409,
+                requiresReconnect: false
+            });
+        }
+
+        if (existingPublish?.status === "pending") {
+            throw new XeroAPIError({
+                message: "This submission is already being published to Xero.",
+                code: "XERO_PUBLISH_IN_PROGRESS",
+                status: 409,
+                requiresReconnect: false
+            });
+        }
+
+        await createXeroPublishRecord({
+            accountId: normalizedAccountId,
+            submissionId,
+            documentHash,
+            status: "pending"
+        });
+    }
+
+    const connection = await ensureFreshXeroConnection(normalizedAccountId);
 
     if (!connection.selectedTenantId) {
-        throw new Error("No Xero organisation has been selected for this account.");
+        throw new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false });
     }
 
     const metadataWithAccounts = {
@@ -1956,36 +2287,82 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         })
     });
 
-    const data = await response.json().catch(() => ({}));
+    const { data, raw } = await readXeroResponse(response);
 
     if (!response.ok) {
-        const details = data?.Elements?.[0]?.ValidationErrors?.map((entry) => entry.Message).join("; ")
-            || data?.Message
-            || `Xero ${documentType} creation failed.`;
-
-        throw new Error(details);
+        const error = classifyXeroError(response.status, data || raw, `Xero ${documentType} creation failed.`);
+        if (submissionId) {
+            await updateXeroPublishRecord({
+                accountId: normalizedAccountId,
+                submissionId,
+                status: "failed",
+                warning: error.message
+            }).catch(() => undefined);
+        }
+        throw error;
     }
 
     const invoice = data?.Invoices?.[0];
 
     if (!invoice?.InvoiceID) {
-        throw new Error("Xero did not return an invoice ID.");
-    }
-
-    for (const file of documentFiles.slice(0, 10)) {
-        await uploadAttachmentToXero({
-            accessToken: connection.accessToken,
-            tenantId: connection.selectedTenantId,
-            invoiceId: invoice.InvoiceID,
-            file
+        throw new XeroAPIError({
+            message: "Xero did not return an invoice ID.",
+            code: "XERO_INVALID_RESPONSE",
+            status: 502,
+            requiresReconnect: false,
+            upstreamStatus: response.status,
+            upstreamBody: data || raw
         });
     }
 
-    return {
+    let attachmentsUploaded = true;
+    let warning = null;
+
+    for (const file of documentFiles.slice(0, 10)) {
+        try {
+            await uploadAttachmentToXero({
+                accessToken: connection.accessToken,
+                tenantId: connection.selectedTenantId,
+                invoiceId: invoice.InvoiceID,
+                file
+            });
+        } catch (error) {
+            attachmentsUploaded = false;
+            warning = error instanceof Error
+                ? `Published to Xero, but attachment upload failed: ${error.message}`
+                : "Published to Xero, but attachment upload failed.";
+            console.warn("Xero attachment upload failed after invoice creation.", {
+                invoiceId: invoice.InvoiceID,
+                message: warning
+            });
+            break;
+        }
+    }
+
+    const result = {
         remoteSubmissionID: invoice.InvoiceID,
+        invoiceId: invoice.InvoiceID,
         confirmationMessage: `${documentType === "sales" ? "Sales invoice" : "Purchase bill"} published directly to Xero for ${connection.selectedTenantName || "the selected organisation"}.`,
+        published: true,
+        idempotent: false,
+        attachmentsUploaded,
+        warning,
         invoice
     };
+
+    if (submissionId) {
+        await updateXeroPublishRecord({
+            accountId: normalizedAccountId,
+            submissionId,
+            invoiceId: invoice.InvoiceID,
+            status: attachmentsUploaded ? "published" : "published_with_attachment_warning",
+            attachmentsUploaded,
+            warning,
+            xeroInvoice: invoice
+        });
+    }
+
+    return result;
 }
 
 async function handleEmailUpload(metadata, documentFiles) {
