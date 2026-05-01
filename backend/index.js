@@ -2464,6 +2464,7 @@ async function handleEmailUpload(metadata, documentFiles) {
 
 async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysisContext = null }) {
     const { originalImageDataURL, enhancedImageDataURL } = await buildReceiptAnalysisImages({ buffer, mimeType });
+    const codingInstructions = buildXeroCodingInstructions(analysisContext);
 
     const body = {
         model: optionalEnvironmentVariables.openAIModel,
@@ -2486,6 +2487,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
                             "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
+                            codingInstructions.systemInstruction
                         ].join(" ")
                     }
                 ]
@@ -2500,7 +2502,8 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "Return titleVendor as the best vendor name for naming the document, and titleAmountText as the best final paid amount text for naming the document.",
                             capturedAt ? `If the document date is unreadable, you may use this fallback capture timestamp: ${capturedAt}.` : "",
                             "Recognized text should contain the important visible text from the document.",
-                            "The second image, if present, is a cleaned enhancement of the same receipt to improve extraction quality."
+                            "The second image, if present, is a cleaned enhancement of the same receipt to improve extraction quality.",
+                            codingInstructions.userInstruction
                         ].filter(Boolean).join(" ")
                     },
                     {
@@ -2542,6 +2545,11 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                         suggestedTitle: { type: "string" },
                         shortDescription: { type: "string" },
                         longDescription: { type: "string" },
+                        selectedNominalCode: { type: ["string", "null"] },
+                        selectedNominalCodeName: { type: ["string", "null"] },
+                        selectedTaxType: { type: ["string", "null"] },
+                        codingReasoning: { type: ["string", "null"] },
+                        codingConfidence: { type: "number" },
                         lineItems: {
                             type: "array",
                             items: {
@@ -2550,9 +2558,16 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                                 properties: {
                                     name: { type: "string" },
                                     quantity: { type: ["string", "null"] },
-                                    amountText: { type: ["string", "null"] }
+                                    amountText: { type: ["string", "null"] },
+                                    nominalCode: { type: ["string", "null"] },
+                                    nominalCodeName: { type: ["string", "null"] },
+                                    taxType: { type: ["string", "null"] },
+                                    taxRateText: { type: ["string", "null"] },
+                                    codingReasoning: { type: ["string", "null"] },
+                                    codingConfidence: { type: "number" },
+                                    requiresReview: { type: "boolean" }
                                 },
-                                required: ["name", "quantity", "amountText"]
+                                required: ["name", "quantity", "amountText", "nominalCode", "nominalCodeName", "taxType", "taxRateText", "codingReasoning", "codingConfidence", "requiresReview"]
                             }
                         },
                         extractedLines: {
@@ -2581,6 +2596,11 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                         "suggestedTitle",
                         "shortDescription",
                         "longDescription",
+                        "selectedNominalCode",
+                        "selectedNominalCodeName",
+                        "selectedTaxType",
+                        "codingReasoning",
+                        "codingConfidence",
                         "lineItems",
                         "extractedLines",
                         "summary",
@@ -2636,13 +2656,29 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
         suggestedTitle: normalizeOptionalString(extraction.suggestedTitle) || "Receipt",
         shortDescription: normalizeOptionalString(extraction.shortDescription) || "Receipt extracted and ready to review.",
         longDescription: normalizeOptionalString(extraction.longDescription) || "Receipt extracted and ready for review.",
+        nominalCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
+        accountCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
+        nominalCodeName: normalizeOptionalString(extraction.selectedNominalCodeName) || null,
+        taxType: normalizeOptionalString(extraction.selectedTaxType) || null,
+        selectedNominalCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
+        selectedNominalCodeName: normalizeOptionalString(extraction.selectedNominalCodeName) || null,
+        selectedTaxType: normalizeOptionalString(extraction.selectedTaxType) || null,
+        codingReasoning: normalizeOptionalString(extraction.codingReasoning) || null,
+        codingConfidence: clampConfidence(extraction.codingConfidence),
         lineItems: Array.isArray(extraction.lineItems)
             ? extraction.lineItems
                 .filter((item) => item && typeof item === "object")
                 .map((item) => ({
                     name: normalizeOptionalString(item.name) || "Item",
                     quantity: normalizeOptionalString(item.quantity) || null,
-                    amountText: normalizeOptionalString(item.amountText) || null
+                    amountText: normalizeOptionalString(item.amountText) || null,
+                    nominalCode: normalizeOptionalString(item.nominalCode) || null,
+                    nominalCodeName: normalizeOptionalString(item.nominalCodeName) || null,
+                    taxType: normalizeOptionalString(item.taxType) || null,
+                    taxRateText: normalizeOptionalString(item.taxRateText) || null,
+                    codingReasoning: normalizeOptionalString(item.codingReasoning) || null,
+                    codingConfidence: clampConfidence(item.codingConfidence),
+                    requiresReview: Boolean(item.requiresReview)
                 }))
                 .filter((item) => item.name && item.name.length > 1)
             : [],
