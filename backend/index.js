@@ -2047,7 +2047,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                     {
                         type: "input_text",
                         text: [
-                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longe[...]
+                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, and short summary",
                             "Return titleVendor as the best vendor name for naming the document, and titleAmountText as the best final paid amount text for naming the document.",
                             capturedAt ? `If the document date is unreadable, you may use this fallback capture timestamp: ${capturedAt}.` : "",
                             "Recognized text should contain the important visible text from the document.",
