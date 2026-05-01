@@ -2252,7 +2252,6 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
         needsReview: Boolean(extraction.needsReview),
         extractionConfidence: clampConfidence(extraction.extractionConfidence)
     };
-}
                     },
                     required: [
                         "recognizedText",
