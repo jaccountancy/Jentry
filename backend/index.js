@@ -528,7 +528,14 @@ app.post("/xero/publish-bill", upload.any(), async (request, response) => {
         response.json({
             submissionId: metadata.submissionId || result.remoteSubmissionID,
             remoteSubmissionID: result.remoteSubmissionID,
+            xeroTransactionID: result.xeroTransactionID || result.invoiceId,
+            xeroTransactionId: result.xeroTransactionID || result.invoiceId,
+            xeroInvoiceID: result.xeroTransactionID || result.invoiceId,
+            xeroInvoiceId: result.xeroTransactionID || result.invoiceId,
+            invoiceID: result.xeroTransactionID || result.invoiceId,
             invoiceId: result.invoiceId,
+            billID: result.xeroTransactionID || result.invoiceId,
+            billId: result.xeroTransactionID || result.invoiceId,
             published: result.published,
             idempotent: result.idempotent || false,
             attachmentsUploaded: result.attachmentsUploaded,
@@ -583,7 +590,14 @@ app.post(
                     submissionId: metadata.submissionId || result.remoteSubmissionID,
                     message: result.confirmationMessage,
                     remoteSubmissionID: result.remoteSubmissionID,
+                    xeroTransactionID: result.xeroTransactionID || result.invoiceId,
+                    xeroTransactionId: result.xeroTransactionID || result.invoiceId,
+                    xeroInvoiceID: result.xeroTransactionID || result.invoiceId,
+                    xeroInvoiceId: result.xeroTransactionID || result.invoiceId,
+                    invoiceID: result.xeroTransactionID || result.invoiceId,
                     invoiceId: result.invoiceId,
+                    billID: result.xeroTransactionID || result.invoiceId,
+                    billId: result.xeroTransactionID || result.invoiceId,
                     published: result.published,
                     idempotent: result.idempotent || false,
                     attachmentsUploaded: result.attachmentsUploaded,
@@ -605,6 +619,62 @@ app.post(
                 return;
             }
             response.status(500).json({ message });
+        }
+    }
+);
+
+app.post(
+    "/xero/attach-document",
+    upload.fields([
+        { name: "documents[]", maxCount: 50 },
+        { name: "documents", maxCount: 50 }
+    ]),
+    async (request, response) => {
+        try {
+            const accountId = normalizeOptionalString(request.body?.accountId || request.body?.accountID);
+            const xeroTransactionId = normalizeOptionalString(
+                request.body?.xeroTransactionId ||
+                request.body?.xeroTransactionID ||
+                request.body?.xeroInvoiceId ||
+                request.body?.xeroInvoiceID ||
+                request.body?.invoiceId ||
+                request.body?.invoiceID ||
+                request.body?.billId ||
+                request.body?.billID
+            );
+            const xeroInvoiceType = normalizeOptionalString(request.body?.xeroInvoiceType);
+            const xeroTargetRecordType = normalizeOptionalString(request.body?.xeroTargetRecordType);
+            const documentFiles = [
+                ...(request.files?.["documents[]"] ?? []),
+                ...(request.files?.documents ?? [])
+            ];
+
+            if (!accountId) {
+                response.status(400).json({ message: "Missing accountId." });
+                return;
+            }
+
+            if (!xeroTransactionId) {
+                response.status(400).json({ message: "Missing xeroTransactionId." });
+                return;
+            }
+
+            if (documentFiles.length === 0) {
+                response.status(400).json({ message: "Missing documents[]." });
+                return;
+            }
+
+            const result = await attachDocumentsToXeroTransaction({
+                accountId,
+                xeroTransactionId,
+                xeroInvoiceType,
+                xeroTargetRecordType,
+                documentFiles
+            });
+
+            response.status(200).json(result);
+        } catch (error) {
+            sendXeroError(response, error, "Unable to attach documents to Xero transaction.");
         }
     }
 );
@@ -904,6 +974,7 @@ app.listen(port, () => {
             "GET /xero/accounts",
             "POST /xero/match-transactions",
             "POST /xero/publish-bill",
+            "POST /xero/attach-document",
             "POST /jentry/uploads",
             "POST /jentry/inbox/register",
             "GET /inbound-email-submissions",
@@ -1421,7 +1492,7 @@ function xeroAppRedirectURI() {
 
 function xeroScopes() {
     const rawScopes = normalizeOptionalString(process.env.XERO_SCOPES)
-        || "openid profile email offline_access accounting.transactions accounting.contacts accounting.settings";
+        || "openid profile email offline_access accounting.transactions accounting.attachments accounting.contacts accounting.settings";
 
     return rawScopes
         .split(/\s+/)
@@ -2245,7 +2316,8 @@ async function buildXeroDocumentPayload(metadata) {
 }
 
 async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }) {
-    const attachmentURL = `${XERO_INVOICES_URL}/${invoiceId}/Attachments/${encodeURIComponent(file.originalname)}`;
+    const filename = normalizeOptionalString(file?.originalname) || `jentry-document-${Date.now()}.pdf`;
+    const attachmentURL = `${XERO_INVOICES_URL}/${invoiceId}/Attachments/${encodeURIComponent(filename)}`;
 
     const response = await fetch(attachmentURL, {
         method: "PUT",
@@ -2253,7 +2325,7 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
             Authorization: `Bearer ${accessToken}`,
             "xero-tenant-id": tenantId,
             Accept: "application/json",
-            "Content-Type": file.mimetype || "application/pdf",
+            "Content-Type": file.mimetype || "application/octet-stream",
             "Content-Length": String(file.buffer.length),
             IncludeOnline: "true"
         },
@@ -2264,6 +2336,67 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
         const { data, raw } = await readXeroResponse(response);
         throw classifyXeroError(response.status, data || raw, "Xero attachment upload failed.");
     }
+}
+
+async function attachDocumentsToXeroTransaction({
+    accountId,
+    xeroTransactionId,
+    xeroInvoiceType = "",
+    xeroTargetRecordType = "",
+    documentFiles = []
+}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    const normalizedTransactionId = normalizeOptionalString(xeroTransactionId);
+
+    if (!normalizedAccountId) {
+        throw new XeroAPIError({ message: "Missing accountId.", code: "XERO_ATTACHMENT_BAD_REQUEST", status: 400 });
+    }
+
+    if (!normalizedTransactionId) {
+        throw new XeroAPIError({ message: "Missing xeroTransactionId.", code: "XERO_ATTACHMENT_BAD_REQUEST", status: 400 });
+    }
+
+    const files = Array.isArray(documentFiles) ? documentFiles.filter((file) => file?.buffer?.length) : [];
+    if (files.length === 0) {
+        throw new XeroAPIError({ message: "Missing documents[].", code: "XERO_ATTACHMENT_BAD_REQUEST", status: 400 });
+    }
+
+    const connection = await ensureFreshXeroConnection(normalizedAccountId);
+    if (!connection.selectedTenantId) {
+        throw new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false });
+    }
+
+    const uploaded = [];
+    for (const file of files) {
+        await uploadAttachmentToXero({
+            accessToken: connection.accessToken,
+            tenantId: connection.selectedTenantId,
+            invoiceId: normalizedTransactionId,
+            file
+        });
+        uploaded.push({
+            filename: normalizeOptionalString(file.originalname) || null,
+            contentType: normalizeOptionalString(file.mimetype) || "application/octet-stream",
+            size: file.size || file.buffer.length
+        });
+    }
+
+    return {
+        ok: true,
+        attached: true,
+        xeroTransactionID: normalizedTransactionId,
+        xeroTransactionId: normalizedTransactionId,
+        xeroInvoiceID: normalizedTransactionId,
+        xeroInvoiceId: normalizedTransactionId,
+        invoiceID: normalizedTransactionId,
+        invoiceId: normalizedTransactionId,
+        billID: normalizedTransactionId,
+        billId: normalizedTransactionId,
+        xeroInvoiceType: xeroInvoiceType || null,
+        xeroTargetRecordType: xeroTargetRecordType || null,
+        attachmentCount: uploaded.length,
+        attachments: uploaded
+    };
 }
 
 async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
@@ -2280,6 +2413,7 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         if (existingPublish?.invoice_id) {
             return {
                 remoteSubmissionID: existingPublish.invoice_id,
+                xeroTransactionID: existingPublish.invoice_id,
                 invoiceId: existingPublish.invoice_id,
                 confirmationMessage: existingPublish.warning || "This submission has already been published to Xero.",
                 published: true,
@@ -2402,6 +2536,7 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
 
     const result = {
         remoteSubmissionID: invoice.InvoiceID,
+        xeroTransactionID: invoice.InvoiceID,
         invoiceId: invoice.InvoiceID,
         confirmationMessage: `${documentType === "sales" ? "Sales invoice" : "Purchase bill"} published directly to Xero for ${connection.selectedTenantName || "the selected organisation"}.`,
         published: true,
