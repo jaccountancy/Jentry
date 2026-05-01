@@ -2277,8 +2277,6 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         "needsReview",
                         "extractionConfidence"
                     ]
-    };
-
     const apiResponse = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
