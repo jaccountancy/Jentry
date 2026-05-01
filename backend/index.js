@@ -2073,7 +2073,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                             "You extract fields from receipts and invoices.",
                             "Read the document image carefully and return only the structured JSON requested.",
                             "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."[...]
-                            "Focus on the single main receipt or invoice in the image, even if other documents are visible around it.",
+    
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
                             "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine t[...]
