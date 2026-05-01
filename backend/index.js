@@ -238,12 +238,15 @@ app.get("/xero/status", async (request, response) => {
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to fetch Xero status.";
-        response.status(200).json({
-            isConnected: false,
-            requiresReconnect: true,
-            connectedUserEmail: null,
-            message
-        });
+response.status(200).json({
+    isConnected: false,
+    requiresReconnect:
+        message.includes("No Xero connection") ||
+        message.includes("cannot be refreshed") ||
+        message.includes("invalid_grant"),
+    connectedUserEmail: null,
+    message
+});
     }
 });
 
@@ -1762,12 +1765,23 @@ async function buildBillLineItems(metadata) {
 
     for (const document of extractedDocuments) {
         // Suggest a code from historical supplier coding in Xero (if available)
+     let suggestedCode = null;
+
+if (normalizeOptionalString(document.merchant)) {
+    try {
         const previousCoding = await findPreviousSupplierCoding({
             accessToken: metadata.accessToken,
             tenantId: metadata.tenantId,
             supplierName: document.merchant
         });
-        const suggestedCode = pickMostCommonAccountCode(previousCoding);
+
+        suggestedCode = pickMostCommonAccountCode(previousCoding);
+    } catch (error) {
+        console.warn("Previous supplier coding lookup failed; continuing without suggestion.", {
+            message: error instanceof Error ? error.message : String(error)
+        });
+    }
+}
 
         const documentLineItems = Array.isArray(document?.lineItems) ? document.lineItems : [];
         const lineItemCode = normalizeOptionalString(document?.nominalCode || document?.accountCode);
