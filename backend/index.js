@@ -2453,7 +2453,7 @@ async function buildRawMessage({ from, to, subject, body, attachments }) {
         subject,
         text: body,
         attachments
-    });
+}
 
     const message = await new Promise((resolve, reject) => {
         composer.compile().build((error, builtMessage) => {
