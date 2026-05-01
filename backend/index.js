@@ -178,7 +178,6 @@ app.get("/oauth/xero/callback", async (request, response) => {
             ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
             : [];
 
-        // persist the initial token set and tenant info (durable storage)
         await upsertXeroConnection(authSession.accountId, () => ({
             accountId: authSession.accountId,
             accessToken: tokenData.access_token,
@@ -223,7 +222,6 @@ app.get("/xero/status", async (request, response) => {
             return;
         }
 
-        // ensureFreshXeroConnection now validates the token by calling Xero and refreshes & persists tokens if required.
         const connection = await ensureFreshXeroConnection(accountId);
 
         response.json({
@@ -472,7 +470,6 @@ app.post(
                     throw new Error("Missing accountId for Xero-integrated submission.");
                 }
 
-                // ensure token is fresh & persisted before creating/publishing document
                 const result = await createXeroLedgerDocument(accountId, metadata, documentFiles);
                 response.json({
                     submissionId: metadata.submissionId || result.remoteSubmissionID,
@@ -679,12 +676,6 @@ app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, r
     }
 });
 
-/**
- * XERO CONTACTS
- *
- * Added missing endpoints so callers do not get 404.
- */
-
 app.get("/xero/contacts", async (req, res) => {
     try {
         const accountId = normalizeOptionalString(req.query.accountId);
@@ -730,11 +721,13 @@ app.post("/xero/ensure-contact", async (req, res) => {
             return;
         }
 
-        // try to find an existing contact (simple name match)
-        const contactsResult = await xeroGetJSON(`${XERO_CONTACTS_URL}?where=Name%20%3D%20%22${encodeURIComponent(contactName)}%22`, {
-            accessToken: connection.accessToken,
-            tenantId: connection.selectedTenantId
-        });
+        const contactsResult = await xeroGetJSON(
+            `${XERO_CONTACTS_URL}?where=Name%20%3D%20%22${encodeURIComponent(contactName)}%22`,
+            {
+                accessToken: connection.accessToken,
+                tenantId: connection.selectedTenantId
+            }
+        );
 
         const existing = Array.isArray(contactsResult?.Contacts) ? contactsResult.Contacts[0] : null;
         if (existing) {
@@ -742,7 +735,6 @@ app.post("/xero/ensure-contact", async (req, res) => {
             return;
         }
 
-        // create contact
         const createResponse = await fetch(XERO_CONTACTS_URL, {
             method: "POST",
             headers: {
@@ -757,7 +749,9 @@ app.post("/xero/ensure-contact", async (req, res) => {
         const created = await createResponse.json().catch(() => ({}));
 
         if (!createResponse.ok) {
-            const errMsg = created?.Elements?.[0]?.ValidationErrors?.map(e => e.Message).join("; ") || created?.Message || `Xero contact creation failed.`;
+            const errMsg = created?.Elements?.[0]?.ValidationErrors?.map((entry) => entry.Message).join("; ")
+                || created?.Message
+                || "Xero contact creation failed.";
             throw new Error(errMsg);
         }
 
@@ -877,9 +871,6 @@ async function problemReportHandler(request, response) {
         response.status(500).json({ message });
     }
 }
-// =========================
-// POSTMARK + DB
-// =========================
 
 async function ensureJentryAccountsTable() {
     await pool.query(`
@@ -1114,10 +1105,6 @@ async function queueInboundEmailProcessing(submission, attachments = []) {
     });
 }
 
-// =========================
-// POSTMARK HELPERS
-// =========================
-
 function extractPrimaryRecipient(payload) {
     const to =
         normalizeOptionalString(payload?.ToFull?.[0]?.Email) ||
@@ -1163,10 +1150,6 @@ function normalizePostmarkAttachments(attachments) {
         })
         .filter(Boolean);
 }
-
-// =========================
-// GENERAL HELPERS
-// =========================
 
 function parseJWTPayload(token) {
     const normalizedToken = normalizeOptionalString(token);
@@ -1337,10 +1320,6 @@ function buildReturnURL(baseURL, params) {
     return target.toString();
 }
 
-// =========================
-// XERO DB HELPERS
-// =========================
-
 async function ensureXeroConnectionsTable() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS xero_connections (
@@ -1400,10 +1379,6 @@ async function deleteXeroConnection(accountId) {
         [normalizedAccountId]
     );
 }
-
-// =========================
-// XERO API HELPERS
-// =========================
 
 async function exchangeXeroToken(params) {
     const body = new URLSearchParams(params);
@@ -1493,15 +1468,6 @@ function tokenExpiresSoon(expiresAt) {
     return new Date(expiresAt).getTime() - Date.now() < 120000;
 }
 
-/**
- * ensureFreshXeroConnection
- *
- * Guarantees the returned connection has a valid accessToken that can be used to call Xero APIs.
- * - If token is expiring soon we refresh immediately and persist the refreshed token set.
- * - If token is not expiring soon we still attempt a lightweight validation call (fetchXeroTenants).
- *   If validation fails (e.g., 401), we attempt one refresh and persist refreshed set.
- * - Throws if no connection exists or if token cannot be refreshed/validated.
- */
 async function ensureFreshXeroConnection(accountId) {
     const connection = await getXeroConnection(accountId);
 
@@ -1509,105 +1475,63 @@ async function ensureFreshXeroConnection(accountId) {
         throw new Error("No Xero connection found for this account.");
     }
 
-    // If token looks close to expiry, refresh immediately and persist
     if (tokenExpiresSoon(connection.expiresAt)) {
-        if (!connection.refreshToken) {
-            throw new Error("Xero connection cannot be refreshed.");
-        }
-
-        const tokenData = await exchangeXeroToken({
-            grant_type: "refresh_token",
-            client_id: xeroClientID(),
-            client_secret: xeroClientSecret(),
-            refresh_token: connection.refreshToken
-        });
-
-        const tenants = await fetchXeroTenants(tokenData.access_token).catch(() => []);
-
-        return upsertXeroConnection(accountId, async (previous) => {
-            const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
-            const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
-
-            const chartOfAccounts = selectedTenant
-                ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
-                    .catch(() => previous?.chartOfAccounts || [])
-                : previous?.chartOfAccounts || [];
-
-            return {
-                accountId: String(accountId),
-                accessToken: tokenData.access_token,
-                refreshToken: tokenData.refresh_token,
-                idToken: tokenData.id_token || null,
-                connectedUserEmail: extractConnectedUserEmail(
-                    tokenData.id_token,
-                    previous?.connectedUserEmail
-                ),
-                scope: tokenData.scope || previous?.scope || xeroScopes(),
-                expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
-                connectedAt: previous?.connectedAt || new Date().toISOString(),
-                lastRefreshedAt: new Date().toISOString(),
-                tenants,
-                selectedTenantId: selectedTenant?.tenantId || null,
-                selectedTenantName: selectedTenant?.tenantName || null,
-                chartOfAccounts,
-                chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
-                    ? new Date().toISOString()
-                    : previous?.chartOfAccountsLastSyncedAt || null
-            };
-        });
+        return refreshXeroConnection(accountId, connection);
     }
 
-    // If token not expiring soon, validate it by calling Xero. If validation fails, try one refresh.
     try {
         await fetchXeroTenants(connection.accessToken);
         return connection;
-    } catch (err) {
-        // attempt one refresh if we have a refresh token
-        if (!connection.refreshToken) {
-            throw new Error("Xero connection cannot be validated and no refresh token is available.");
-        }
-
-        const tokenData = await exchangeXeroToken({
-            grant_type: "refresh_token",
-            client_id: xeroClientID(),
-            client_secret: xeroClientSecret(),
-            refresh_token: connection.refreshToken
-        });
-
-        const tenants = await fetchXeroTenants(tokenData.access_token).catch(() => []);
-
-        return upsertXeroConnection(accountId, async (previous) => {
-            const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
-            const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
-
-            const chartOfAccounts = selectedTenant
-                ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
-                    .catch(() => previous?.chartOfAccounts || [])
-                : previous?.chartOfAccounts || [];
-
-            return {
-                accountId: String(accountId),
-                accessToken: tokenData.access_token,
-                refreshToken: tokenData.refresh_token,
-                idToken: tokenData.id_token || null,
-                connectedUserEmail: extractConnectedUserEmail(
-                    tokenData.id_token,
-                    previous?.connectedUserEmail
-                ),
-                scope: tokenData.scope || previous?.scope || xeroScopes(),
-                expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
-                connectedAt: previous?.connectedAt || new Date().toISOString(),
-                lastRefreshedAt: new Date().toISOString(),
-                tenants,
-                selectedTenantId: selectedTenant?.tenantId || null,
-                selectedTenantName: selectedTenant?.tenantName || null,
-                chartOfAccounts,
-                chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
-                    ? new Date().toISOString()
-                    : previous?.chartOfAccountsLastSyncedAt || null
-            };
-        });
+    } catch {
+        return refreshXeroConnection(accountId, connection);
     }
+}
+
+async function refreshXeroConnection(accountId, connection) {
+    if (!connection.refreshToken) {
+        throw new Error("Xero connection cannot be refreshed.");
+    }
+
+    const tokenData = await exchangeXeroToken({
+        grant_type: "refresh_token",
+        client_id: xeroClientID(),
+        client_secret: xeroClientSecret(),
+        refresh_token: connection.refreshToken
+    });
+
+    const tenants = await fetchXeroTenants(tokenData.access_token).catch(() => []);
+
+    return upsertXeroConnection(accountId, async (previous) => {
+        const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
+        const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
+
+        const chartOfAccounts = selectedTenant
+            ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
+                .catch(() => previous?.chartOfAccounts || [])
+            : previous?.chartOfAccounts || [];
+
+        return {
+            accountId: String(accountId),
+            accessToken: tokenData.access_token,
+            refreshToken: tokenData.refresh_token,
+            idToken: tokenData.id_token || null,
+            connectedUserEmail: extractConnectedUserEmail(
+                tokenData.id_token,
+                previous?.connectedUserEmail
+            ),
+            scope: tokenData.scope || previous?.scope || xeroScopes(),
+            expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
+            connectedAt: previous?.connectedAt || new Date().toISOString(),
+            lastRefreshedAt: new Date().toISOString(),
+            tenants,
+            selectedTenantId: selectedTenant?.tenantId || null,
+            selectedTenantName: selectedTenant?.tenantName || null,
+            chartOfAccounts,
+            chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
+                ? new Date().toISOString()
+                : previous?.chartOfAccountsLastSyncedAt || null
+        };
+    });
 }
 
 async function xeroGetJSON(url, { accessToken, tenantId }) {
@@ -1627,10 +1551,6 @@ async function xeroGetJSON(url, { accessToken, tenantId }) {
 
     return data;
 }
-
-// =========================
-// XERO MATCHING
-// =========================
 
 async function findMatchingXeroTransactions({ accessToken, tenantId, document }) {
     const merchant = normalizeOptionalString(document.merchant);
@@ -1703,24 +1623,16 @@ function scoreTransactionMatch(candidate, document) {
 
     if (document.totalAmount != null && candidate.amount != null) {
         const delta = Math.abs(document.totalAmount - candidate.amount);
-        if (delta < 0.01) {
-            score += 30;
-        } else if (delta <= 1) {
-            score += 18;
-        } else if (delta <= 5) {
-            score += 8;
-        }
+        if (delta < 0.01) score += 30;
+        else if (delta <= 1) score += 18;
+        else if (delta <= 5) score += 8;
     }
 
     const daysApart = dayDistance(document.dateISO, candidate.date);
     if (daysApart != null) {
-        if (daysApart === 0) {
-            score += 25;
-        } else if (daysApart <= 3) {
-            score += 15;
-        } else if (daysApart <= 10) {
-            score += 6;
-        }
+        if (daysApart === 0) score += 25;
+        else if (daysApart <= 3) score += 15;
+        else if (daysApart <= 10) score += 6;
     }
 
     return {
@@ -1783,10 +1695,6 @@ function formatCurrency(value) {
         currency: "GBP"
     }).format(value);
 }
-
-// =========================
-// XERO BILL / INVOICE CREATION
-// =========================
 
 function pickDocumentDate(extractedDocuments) {
     const candidates = Array.isArray(extractedDocuments) ? extractedDocuments : [];
@@ -1953,7 +1861,6 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
 }
 
 async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
-    // ensure tokens are fresh & persisted before attempting to create invoice/attachments
     const connection = await ensureFreshXeroConnection(accountId);
 
     if (!connection.selectedTenantId) {
@@ -2014,10 +1921,6 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         invoice
     };
 }
-
-// =========================
-// EMAIL + OPENAI
-// =========================
 
 async function handleEmailUpload(metadata, documentFiles) {
     const to = normalizeEmail(metadata.deliveryTo);
@@ -2252,95 +2155,6 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
         needsReview: Boolean(extraction.needsReview),
         extractionConfidence: clampConfidence(extraction.extractionConfidence)
     };
-                    }
-                    required: [
-                        "recognizedText",
-                        "merchant",
-                        "totalAmount",
-                        "currency",
-                        "totalText",
-                        "titleVendor",
-                        "titleAmountText",
-                        "vatAmount",
-                        "vatText",
-                        "dateISO",
-                        "dateText",
-                        "invoiceNumber",
-                        "paymentMethod",
-                        "category",
-                        "suggestedTitle",
-                        "shortDescription",
-                        "longDescription",
-                        "lineItems",
-                        "extractedLines",
-                        "summary",
-                        "needsReview",
-                        "extractionConfidence"
-                    ]
-    const apiResponse = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${optionalEnvironmentVariables.openAIAPIKey}`,
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-    });
-
-    const rawResponse = await apiResponse.text();
-
-    if (!apiResponse.ok) {
-        throw new Error(`OpenAI extraction failed: ${rawResponse}`);
-    }
-
-    const parsedResponse = JSON.parse(rawResponse);
-    const outputText = typeof parsedResponse.output_text === "string"
-        ? parsedResponse.output_text
-        : extractOutputText(parsedResponse);
-
-    if (!outputText) {
-        throw new Error("OpenAI extraction returned no JSON payload.");
-    }
-
-    const extraction = JSON.parse(outputText);
-
-    return {
-        recognizedText: normalizeOptionalString(extraction.recognizedText),
-        merchant: normalizeOptionalString(extraction.merchant) || null,
-        totalAmount: typeof extraction.totalAmount === "number" ? extraction.totalAmount : null,
-        currency: normalizeOptionalString(extraction.currency) || "GBP",
-        totalText: normalizeOptionalString(extraction.totalText) || null,
-        titleVendor: normalizeOptionalString(extraction.titleVendor) || null,
-        titleAmountText: normalizeOptionalString(extraction.titleAmountText) || null,
-        vatAmount: typeof extraction.vatAmount === "number" ? extraction.vatAmount : null,
-        vatText: normalizeOptionalString(extraction.vatText) || null,
-        dateISO: normalizeOptionalString(extraction.dateISO) || null,
-        dateText: normalizeOptionalString(extraction.dateText) || null,
-        invoiceNumber: normalizeOptionalString(extraction.invoiceNumber) || null,
-        paymentMethod: normalizeOptionalString(extraction.paymentMethod) || null,
-        category: normalizeOptionalString(extraction.category) || null,
-        suggestedTitle: normalizeOptionalString(extraction.suggestedTitle) || "Receipt",
-        shortDescription: normalizeOptionalString(extraction.shortDescription) || "Receipt extracted and ready to review.",
-        longDescription: normalizeOptionalString(extraction.longDescription) || "Receipt extracted and ready for review.",
-        lineItems: Array.isArray(extraction.lineItems)
-            ? extraction.lineItems
-                .filter((item) => item && typeof item === "object")
-                .map((item) => ({
-                    name: normalizeOptionalString(item.name) || "Item",
-                    quantity: normalizeOptionalString(item.quantity) || null,
-                    amountText: normalizeOptionalString(item.amountText) || null
-                }))
-                .filter((item) => item.name && item.name.length > 1)
-            : [],
-        extractedLines: Array.isArray(extraction.extractedLines)
-            ? extraction.extractedLines
-                .filter((line) => typeof line === "string")
-                .map((line) => normalizeOptionalString(line))
-                .filter(Boolean)
-            : [],
-        summary: normalizeOptionalString(extraction.summary) || "Receipt ready for review.",
-        needsReview: Boolean(extraction.needsReview),
-        extractionConfidence: clampConfidence(extraction.extractionConfidence)
-    };
 }
 
 async function buildReceiptAnalysisImages({ buffer, mimeType }) {
@@ -2442,13 +2256,15 @@ function clampConfidence(value) {
 }
 
 async function buildRawMessage({ from, to, subject, body, attachments }) {
-    const composer = new MailComposer.MailComposer({
+    const MailComposerClass = MailComposer.MailComposer || MailComposer;
+
+    const composer = new MailComposerClass({
         from,
         to,
         subject,
         text: body,
         attachments
-}
+    });
 
     const message = await new Promise((resolve, reject) => {
         composer.compile().build((error, builtMessage) => {
