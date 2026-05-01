@@ -66,6 +66,7 @@ const XERO_CONNECTIONS_URL = "https://api.xero.com/connections";
 const XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices";
 const XERO_ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts";
 const XERO_BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions";
+const XERO_CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts";
 const xeroAuthSessions = new Map();
 
 const pool = new Pool({
@@ -177,6 +178,7 @@ app.get("/oauth/xero/callback", async (request, response) => {
             ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
             : [];
 
+        // persist the initial token set and tenant info (durable storage)
         await upsertXeroConnection(authSession.accountId, () => ({
             accountId: authSession.accountId,
             accessToken: tokenData.access_token,
@@ -221,37 +223,24 @@ app.get("/xero/status", async (request, response) => {
             return;
         }
 
-        const connection = await getXeroConnection(accountId);
-        if (!connection) {
-            response.json({
-                isConnected: false,
-                requiresReconnect: false,
-                connectedUserEmail: null,
-                selectedTenantId: null,
-                selectedTenantName: null,
-                tenants: [],
-                chartOfAccountsLastSyncedAt: null,
-                chartOfAccountsCount: 0
-            });
-            return;
-        }
+        // ensureFreshXeroConnection now validates the token by calling Xero and refreshes & persists tokens if required.
+        const connection = await ensureFreshXeroConnection(accountId);
 
-        const fresh = await ensureFreshXeroConnection(accountId);
         response.json({
             isConnected: true,
             requiresReconnect: false,
-            connectedUserEmail: fresh.connectedUserEmail || null,
-            selectedTenantId: fresh.selectedTenantId || null,
-            selectedTenantName: fresh.selectedTenantName || null,
-            tenants: fresh.tenants || [],
-            connectedAt: fresh.connectedAt || null,
-            expiresAt: fresh.expiresAt || null,
-            chartOfAccountsLastSyncedAt: fresh.chartOfAccountsLastSyncedAt || null,
-            chartOfAccountsCount: Array.isArray(fresh.chartOfAccounts) ? fresh.chartOfAccounts.length : 0
+            connectedUserEmail: connection.connectedUserEmail || null,
+            selectedTenantId: connection.selectedTenantId || null,
+            selectedTenantName: connection.selectedTenantName || null,
+            tenants: connection.tenants || [],
+            connectedAt: connection.connectedAt || null,
+            expiresAt: connection.expiresAt || null,
+            chartOfAccountsLastSyncedAt: connection.chartOfAccountsLastSyncedAt || null,
+            chartOfAccountsCount: Array.isArray(connection.chartOfAccounts) ? connection.chartOfAccounts.length : 0
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : "Unable to fetch Xero status.";
-        response.status(500).json({
+        response.status(200).json({
             isConnected: false,
             requiresReconnect: true,
             connectedUserEmail: null,
@@ -483,6 +472,7 @@ app.post(
                     throw new Error("Missing accountId for Xero-integrated submission.");
                 }
 
+                // ensure token is fresh & persisted before creating/publishing document
                 const result = await createXeroLedgerDocument(accountId, metadata, documentFiles);
                 response.json({
                     submissionId: metadata.submissionId || result.remoteSubmissionID,
@@ -689,6 +679,99 @@ app.post("/inbound/postmark", express.json({ limit: "25mb" }), async (request, r
     }
 });
 
+/**
+ * XERO CONTACTS
+ *
+ * Added missing endpoints so callers do not get 404.
+ */
+
+app.get("/xero/contacts", async (req, res) => {
+    try {
+        const accountId = normalizeOptionalString(req.query.accountId);
+        if (!accountId) {
+            res.status(400).json({ message: "Missing accountId." });
+            return;
+        }
+
+        const connection = await ensureFreshXeroConnection(accountId);
+        if (!connection.selectedTenantId) {
+            res.status(400).json({ message: "No Xero tenant selected." });
+            return;
+        }
+
+        const data = await xeroGetJSON(XERO_CONTACTS_URL, {
+            accessToken: connection.accessToken,
+            tenantId: connection.selectedTenantId
+        });
+
+        res.json({
+            contacts: Array.isArray(data?.Contacts) ? data.Contacts : []
+        });
+    } catch (error) {
+        res.status(500).json({
+            message: error instanceof Error ? error.message : "Unable to load Xero contacts."
+        });
+    }
+});
+
+app.post("/xero/ensure-contact", async (req, res) => {
+    try {
+        const accountId = normalizeOptionalString(req.body?.accountId);
+        const contactName = normalizeOptionalString(req.body?.contactName);
+
+        if (!accountId || !contactName) {
+            res.status(400).json({ message: "Missing accountId or contactName." });
+            return;
+        }
+
+        const connection = await ensureFreshXeroConnection(accountId);
+        if (!connection.selectedTenantId) {
+            res.status(400).json({ message: "No Xero tenant selected." });
+            return;
+        }
+
+        // try to find an existing contact (simple name match)
+        const contactsResult = await xeroGetJSON(`${XERO_CONTACTS_URL}?where=Name%20%3D%20%22${encodeURIComponent(contactName)}%22`, {
+            accessToken: connection.accessToken,
+            tenantId: connection.selectedTenantId
+        });
+
+        const existing = Array.isArray(contactsResult?.Contacts) ? contactsResult.Contacts[0] : null;
+        if (existing) {
+            res.json({ contact: existing, created: false });
+            return;
+        }
+
+        // create contact
+        const createResponse = await fetch(XERO_CONTACTS_URL, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${connection.accessToken}`,
+                "xero-tenant-id": connection.selectedTenantId,
+                Accept: "application/json",
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({ Contacts: [{ Name: contactName }] })
+        });
+
+        const created = await createResponse.json().catch(() => ({}));
+
+        if (!createResponse.ok) {
+            const errMsg = created?.Elements?.[0]?.ValidationErrors?.map(e => e.Message).join("; ") || created?.Message || `Xero contact creation failed.`;
+            throw new Error(errMsg);
+        }
+
+        res.json({
+            contact: Array.isArray(created?.Contacts) ? created.Contacts[0] : created,
+            created: true
+        });
+    } catch (error) {
+        res.status(500).json({
+            message: error instanceof Error ? error.message : "Unable to ensure contact in Xero."
+        });
+    }
+});
+
 app.use((request, response) => {
     response.status(404).send(`Cannot ${request.method} ${request.path}`);
 });
@@ -714,7 +797,9 @@ app.listen(port, () => {
             "POST /jentry/analyze",
             "POST /problem-report",
             "POST /jentry/problem-report",
-            "POST /inbound/postmark"
+            "POST /inbound/postmark",
+            "GET /xero/contacts",
+            "POST /xero/ensure-contact"
         ]
     }));
 });
@@ -1408,6 +1493,15 @@ function tokenExpiresSoon(expiresAt) {
     return new Date(expiresAt).getTime() - Date.now() < 120000;
 }
 
+/**
+ * ensureFreshXeroConnection
+ *
+ * Guarantees the returned connection has a valid accessToken that can be used to call Xero APIs.
+ * - If token is expiring soon we refresh immediately and persist the refreshed token set.
+ * - If token is not expiring soon we still attempt a lightweight validation call (fetchXeroTenants).
+ *   If validation fails (e.g., 401), we attempt one refresh and persist refreshed set.
+ * - Throws if no connection exists or if token cannot be refreshed/validated.
+ */
 async function ensureFreshXeroConnection(accountId) {
     const connection = await getXeroConnection(accountId);
 
@@ -1415,54 +1509,105 @@ async function ensureFreshXeroConnection(accountId) {
         throw new Error("No Xero connection found for this account.");
     }
 
-    if (!tokenExpiresSoon(connection.expiresAt)) {
+    // If token looks close to expiry, refresh immediately and persist
+    if (tokenExpiresSoon(connection.expiresAt)) {
+        if (!connection.refreshToken) {
+            throw new Error("Xero connection cannot be refreshed.");
+        }
+
+        const tokenData = await exchangeXeroToken({
+            grant_type: "refresh_token",
+            client_id: xeroClientID(),
+            client_secret: xeroClientSecret(),
+            refresh_token: connection.refreshToken
+        });
+
+        const tenants = await fetchXeroTenants(tokenData.access_token).catch(() => []);
+
+        return upsertXeroConnection(accountId, async (previous) => {
+            const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
+            const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
+
+            const chartOfAccounts = selectedTenant
+                ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
+                    .catch(() => previous?.chartOfAccounts || [])
+                : previous?.chartOfAccounts || [];
+
+            return {
+                accountId: String(accountId),
+                accessToken: tokenData.access_token,
+                refreshToken: tokenData.refresh_token,
+                idToken: tokenData.id_token || null,
+                connectedUserEmail: extractConnectedUserEmail(
+                    tokenData.id_token,
+                    previous?.connectedUserEmail
+                ),
+                scope: tokenData.scope || previous?.scope || xeroScopes(),
+                expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
+                connectedAt: previous?.connectedAt || new Date().toISOString(),
+                lastRefreshedAt: new Date().toISOString(),
+                tenants,
+                selectedTenantId: selectedTenant?.tenantId || null,
+                selectedTenantName: selectedTenant?.tenantName || null,
+                chartOfAccounts,
+                chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
+                    ? new Date().toISOString()
+                    : previous?.chartOfAccountsLastSyncedAt || null
+            };
+        });
+    }
+
+    // If token not expiring soon, validate it by calling Xero. If validation fails, try one refresh.
+    try {
+        await fetchXeroTenants(connection.accessToken);
         return connection;
+    } catch (err) {
+        // attempt one refresh if we have a refresh token
+        if (!connection.refreshToken) {
+            throw new Error("Xero connection cannot be validated and no refresh token is available.");
+        }
+
+        const tokenData = await exchangeXeroToken({
+            grant_type: "refresh_token",
+            client_id: xeroClientID(),
+            client_secret: xeroClientSecret(),
+            refresh_token: connection.refreshToken
+        });
+
+        const tenants = await fetchXeroTenants(tokenData.access_token).catch(() => []);
+
+        return upsertXeroConnection(accountId, async (previous) => {
+            const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
+            const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
+
+            const chartOfAccounts = selectedTenant
+                ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
+                    .catch(() => previous?.chartOfAccounts || [])
+                : previous?.chartOfAccounts || [];
+
+            return {
+                accountId: String(accountId),
+                accessToken: tokenData.access_token,
+                refreshToken: tokenData.refresh_token,
+                idToken: tokenData.id_token || null,
+                connectedUserEmail: extractConnectedUserEmail(
+                    tokenData.id_token,
+                    previous?.connectedUserEmail
+                ),
+                scope: tokenData.scope || previous?.scope || xeroScopes(),
+                expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
+                connectedAt: previous?.connectedAt || new Date().toISOString(),
+                lastRefreshedAt: new Date().toISOString(),
+                tenants,
+                selectedTenantId: selectedTenant?.tenantId || null,
+                selectedTenantName: selectedTenant?.tenantName || null,
+                chartOfAccounts,
+                chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
+                    ? new Date().toISOString()
+                    : previous?.chartOfAccountsLastSyncedAt || null
+            };
+        });
     }
-
-    if (!connection.refreshToken) {
-        throw new Error("Xero connection cannot be refreshed.");
-    }
-
-    const tokenData = await exchangeXeroToken({
-        grant_type: "refresh_token",
-        client_id: xeroClientID(),
-        client_secret: xeroClientSecret(),
-        refresh_token: connection.refreshToken
-    });
-
-    const tenants = await fetchXeroTenants(tokenData.access_token);
-
-    return upsertXeroConnection(accountId, async (previous) => {
-        const selectedTenantId = previous?.selectedTenantId || tenants[0]?.tenantId || null;
-        const selectedTenant = tenants.find((tenant) => tenant.tenantId === selectedTenantId) || tenants[0] || null;
-
-        const chartOfAccounts = selectedTenant
-            ? await fetchChartOfAccounts(tokenData.access_token, selectedTenant.tenantId)
-                .catch(() => previous?.chartOfAccounts || [])
-            : previous?.chartOfAccounts || [];
-
-        return {
-            accountId: String(accountId),
-            accessToken: tokenData.access_token,
-            refreshToken: tokenData.refresh_token,
-            idToken: tokenData.id_token || null,
-            connectedUserEmail: extractConnectedUserEmail(
-                tokenData.id_token,
-                previous?.connectedUserEmail
-            ),
-            scope: tokenData.scope || previous?.scope || xeroScopes(),
-            expiresAt: new Date(Date.now() + Number(tokenData.expires_in || 1800) * 1000).toISOString(),
-            connectedAt: previous?.connectedAt || new Date().toISOString(),
-            lastRefreshedAt: new Date().toISOString(),
-            tenants,
-            selectedTenantId: selectedTenant?.tenantId || null,
-            selectedTenantName: selectedTenant?.tenantName || null,
-            chartOfAccounts,
-            chartOfAccountsLastSyncedAt: chartOfAccounts.length > 0
-                ? new Date().toISOString()
-                : previous?.chartOfAccountsLastSyncedAt || null
-        };
-    });
 }
 
 async function xeroGetJSON(url, { accessToken, tenantId }) {
@@ -1808,6 +1953,7 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
 }
 
 async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
+    // ensure tokens are fresh & persisted before attempting to create invoice/attachments
     const connection = await ensureFreshXeroConnection(accountId);
 
     if (!connection.selectedTenantId) {
@@ -1926,17 +2072,17 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         text: [
                             "You extract fields from receipts and invoices.",
                             "Read the document image carefully and return only the structured JSON requested.",
-                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice.",
+                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."[...]
                             "Focus on the single main receipt or invoice in the image, even if other documents are visible around it.",
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
-                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine text and totals.",
+                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine t[...]
                             "If a PDF is supplied, it has been converted to an image preview of its first page before analysis.",
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses as the vendor.",
-                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or invoice details visible."
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses [...]
+                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or in[...]
                         ].join(" ")
                     }
                 ]
@@ -1947,7 +2093,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                     {
                         type: "input_text",
                         text: [
-                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longer plain-English description.",
+                            "Extract the merchant, final paid total, currency, date, VAT amount if visible, invoice or receipt number if visible, payment method, category, a short summary, and a longe[...]
                             "Return titleVendor as the best vendor name for naming the document, and titleAmountText as the best final paid amount text for naming the document.",
                             capturedAt ? `If the document date is unreadable, you may use this fallback capture timestamp: ${capturedAt}.` : "",
                             "Recognized text should contain the important visible text from the document.",
