@@ -2027,16 +2027,16 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         text: [
                             "You extract fields from receipts and invoices.",
                             "Read the document image carefully and return only the structured JSON requested.",
-                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."[...]
+                            "The user may photograph a receipt while it is lying on top of other papers, screens, or notes. Ignore any background text that is not part of the main receipt or invoice."
                             "Prefer the merchant's trading name over street names, phone numbers, card brands, or generic receipt wording.",
                             "Prefer the final amount paid or grand total over line items, VAT lines, auth references, or subtotal lines.",
-                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version for fine t[...]
+                            "You may receive both an original document image and a cleaned high-contrast enhancement of the same document. Use both together, but prefer the enhanced version
                             "If a PDF is supplied, it has been converted to an image preview of its first page before analysis.",
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses [...]
-                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or in[...]
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses 
+                            "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment or in
                         ].join(" ")
                     }
                 ]
