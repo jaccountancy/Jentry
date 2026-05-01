@@ -2343,10 +2343,37 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
         body: file.buffer
     });
 
+    const { data, raw } = await readXeroResponse(response);
+    const responseBody = data || raw || null;
+
+    console.log("Xero attachment response received.", {
+        xeroTransactionID: invoiceId,
+        filename,
+        xeroResponseStatus: response.status,
+        xeroResponseBody: responseBody
+    });
+
     if (!response.ok) {
-        const { data, raw } = await readXeroResponse(response);
-        throw classifyXeroError(response.status, data || raw, "Xero attachment upload failed.");
+        throw classifyXeroError(response.status, responseBody, "Xero attachment upload failed.");
     }
+
+    const attachment = Array.isArray(data?.Attachments) ? data.Attachments[0] : data?.Attachments || data || null;
+
+    return compactObject({
+        fileName: filename,
+        filename,
+        xeroAttachmentId: normalizeOptionalString(
+            attachment?.AttachmentID ||
+            attachment?.AttachmentId ||
+            attachment?.attachmentID ||
+            attachment?.attachmentId
+        ) || null,
+        xeroFileName: normalizeOptionalString(attachment?.FileName || attachment?.filename || attachment?.fileName) || filename,
+        contentType: normalizeOptionalString(file.mimetype) || "application/octet-stream",
+        size: file.size || file.buffer.length,
+        xeroResponseStatus: response.status,
+        xeroResponseBody: responseBody
+    });
 }
 
 async function addXeroInvoiceHistory({ accessToken, tenantId, invoiceId, historyDetail }) {
@@ -2404,22 +2431,19 @@ async function attachDocumentsToXeroTransaction({
         throw new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false });
     }
 
-    const uploaded = [];
+    const attachedFiles = [];
     for (const file of files) {
-        await uploadAttachmentToXero({
+        const attachedFile = await uploadAttachmentToXero({
             accessToken: connection.accessToken,
             tenantId: connection.selectedTenantId,
             invoiceId: normalizedTransactionId,
             file
         });
-        uploaded.push({
-            filename: normalizeOptionalString(file.originalname) || null,
-            contentType: normalizeOptionalString(file.mimetype) || "application/octet-stream",
-            size: file.size || file.buffer.length
-        });
+        attachedFiles.push(attachedFile);
     }
 
     return {
+        success: true,
         ok: true,
         attached: true,
         xeroTransactionID: normalizedTransactionId,
@@ -2432,8 +2456,9 @@ async function attachDocumentsToXeroTransaction({
         billId: normalizedTransactionId,
         xeroInvoiceType: xeroInvoiceType || null,
         xeroTargetRecordType: xeroTargetRecordType || null,
-        attachmentCount: uploaded.length,
-        attachments: uploaded
+        attachmentCount: attachedFiles.length,
+        attachedFiles,
+        attachments: attachedFiles
     };
 }
 
