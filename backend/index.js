@@ -64,6 +64,7 @@ const XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize";
 const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
 const XERO_CONNECTIONS_URL = "https://api.xero.com/connections";
 const XERO_INVOICES_URL = "https://api.xero.com/api.xro/2.0/Invoices";
+const XERO_INVOICE_HISTORY_URL = (invoiceId) => `${XERO_INVOICES_URL}/${encodeURIComponent(invoiceId)}/History`;
 const XERO_ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts";
 const XERO_BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions";
 const XERO_CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts";
@@ -1410,6 +1411,16 @@ function normalizeOptionalString(value) {
     return trimmed ? trimmed : "";
 }
 
+function buildXeroHistoryDetail(metadata = {}) {
+    const submittedByName = normalizeOptionalString(metadata.submittedByName);
+    const submittedByEmail = normalizeOptionalString(metadata.submittedByEmail);
+    const submitterLabel = submittedByEmail || submittedByName || null;
+
+    return submitterLabel
+        ? `Submitted with Xero API by Jentry through ${submitterLabel}`
+        : "Submitted with Xero API by Jentry";
+}
+
 function parseJSONField(value, fallback) {
     if (value == null || value === "") {
         return fallback;
@@ -2338,6 +2349,33 @@ async function uploadAttachmentToXero({ accessToken, tenantId, invoiceId, file }
     }
 }
 
+async function addXeroInvoiceHistory({ accessToken, tenantId, invoiceId, historyDetail }) {
+    const detail = normalizeOptionalString(historyDetail);
+    if (!detail) return;
+
+    const response = await fetch(XERO_INVOICE_HISTORY_URL(invoiceId), {
+        method: "PUT",
+        headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "xero-tenant-id": tenantId,
+            Accept: "application/json",
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            HistoryRecords: [
+                {
+                    Details: detail
+                }
+            ]
+        })
+    });
+
+    if (!response.ok) {
+        const { data, raw } = await readXeroResponse(response);
+        throw classifyXeroError(response.status, data || raw, "Xero history update failed.");
+    }
+}
+
 async function attachDocumentsToXeroTransaction({
     accountId,
     xeroTransactionId,
@@ -2512,6 +2550,25 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
 
     let attachmentsUploaded = true;
     let warning = null;
+    const historyDetail = buildXeroHistoryDetail(metadata);
+
+    try {
+        await addXeroInvoiceHistory({
+            accessToken: connection.accessToken,
+            tenantId: connection.selectedTenantId,
+            invoiceId: invoice.InvoiceID,
+            historyDetail
+        });
+    } catch (error) {
+        warning = error instanceof Error
+            ? `Published to Xero, but history update failed: ${error.message}`
+            : "Published to Xero, but history update failed.";
+        console.warn("Xero history update failed after invoice creation.", {
+            invoiceId: invoice.InvoiceID,
+            historyDetail,
+            message: warning
+        });
+    }
 
     for (const file of documentFiles.slice(0, 10)) {
         try {
@@ -2523,9 +2580,10 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
             });
         } catch (error) {
             attachmentsUploaded = false;
-            warning = error instanceof Error
+            const attachmentWarning = error instanceof Error
                 ? `Published to Xero, but attachment upload failed: ${error.message}`
                 : "Published to Xero, but attachment upload failed.";
+            warning = warning ? `${warning} ${attachmentWarning}` : attachmentWarning;
             console.warn("Xero attachment upload failed after invoice creation.", {
                 invoiceId: invoice.InvoiceID,
                 message: warning
@@ -2538,7 +2596,7 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         remoteSubmissionID: invoice.InvoiceID,
         xeroTransactionID: invoice.InvoiceID,
         invoiceId: invoice.InvoiceID,
-        confirmationMessage: `${documentType === "sales" ? "Sales invoice" : "Purchase bill"} published directly to Xero for ${connection.selectedTenantName || "the selected organisation"}.`,
+        confirmationMessage: "Submission accepted and published to Xero.",
         published: true,
         idempotent: false,
         attachmentsUploaded,
