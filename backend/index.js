@@ -2487,7 +2487,8 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
                             "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
-                            codingInstructions.systemInstruction
+                            codingInstructions.systemInstruction,
+                            "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
                         ].join(" ")
                     }
                 ]
@@ -2542,14 +2543,18 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                         invoiceNumber: { type: ["string", "null"] },
                         paymentMethod: { type: ["string", "null"] },
                         category: { type: ["string", "null"] },
-                        suggestedTitle: { type: "string" },
-                        shortDescription: { type: "string" },
-                        longDescription: { type: "string" },
                         selectedNominalCode: { type: ["string", "null"] },
                         selectedNominalCodeName: { type: ["string", "null"] },
                         selectedTaxType: { type: ["string", "null"] },
+                        nominalCode: { type: ["string", "null"] },
+                        accountCode: { type: ["string", "null"] },
+                        taxType: { type: ["string", "null"] },
+                        taxTreatment: { type: ["string", "null"] },
                         codingReasoning: { type: ["string", "null"] },
-                        codingConfidence: { type: "number" },
+                        codingConfidence: { type: ["number", "null"] },
+                        suggestedTitle: { type: "string" },
+                        shortDescription: { type: "string" },
+                        longDescription: { type: "string" },
                         lineItems: {
                             type: "array",
                             items: {
@@ -2562,12 +2567,13 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                                     nominalCode: { type: ["string", "null"] },
                                     nominalCodeName: { type: ["string", "null"] },
                                     taxType: { type: ["string", "null"] },
+                                    taxTreatment: { type: ["string", "null"] },
                                     taxRateText: { type: ["string", "null"] },
                                     codingReasoning: { type: ["string", "null"] },
-                                    codingConfidence: { type: "number" },
+                                    codingConfidence: { type: ["number", "null"] },
                                     requiresReview: { type: "boolean" }
                                 },
-                                required: ["name", "quantity", "amountText", "nominalCode", "nominalCodeName", "taxType", "taxRateText", "codingReasoning", "codingConfidence", "requiresReview"]
+                                required: ["name", "quantity", "amountText", "nominalCode", "nominalCodeName", "taxType", "taxTreatment", "taxRateText", "codingReasoning", "codingConfidence", "requiresReview"]
                             }
                         },
                         extractedLines: {
@@ -2593,14 +2599,18 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                         "invoiceNumber",
                         "paymentMethod",
                         "category",
-                        "suggestedTitle",
-                        "shortDescription",
-                        "longDescription",
                         "selectedNominalCode",
                         "selectedNominalCodeName",
                         "selectedTaxType",
+                        "nominalCode",
+                        "accountCode",
+                        "taxType",
+                        "taxTreatment",
                         "codingReasoning",
                         "codingConfidence",
+                        "suggestedTitle",
+                        "shortDescription",
+                        "longDescription",
                         "lineItems",
                         "extractedLines",
                         "summary",
@@ -2638,7 +2648,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
 
     const extraction = JSON.parse(outputText);
 
-    return {
+    const normalizedExtraction = {
         recognizedText: normalizeOptionalString(extraction.recognizedText),
         merchant: normalizeOptionalString(extraction.merchant) || null,
         totalAmount: typeof extraction.totalAmount === "number" ? extraction.totalAmount : null,
@@ -2653,18 +2663,18 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
         invoiceNumber: normalizeOptionalString(extraction.invoiceNumber) || null,
         paymentMethod: normalizeOptionalString(extraction.paymentMethod) || null,
         category: normalizeOptionalString(extraction.category) || null,
+        selectedNominalCode: normalizeOptionalString(extraction.selectedNominalCode) || normalizeOptionalString(extraction.nominalCode) || normalizeOptionalString(extraction.accountCode) || null,
+        selectedNominalCodeName: normalizeOptionalString(extraction.selectedNominalCodeName) || null,
+        selectedTaxType: normalizeOptionalString(extraction.selectedTaxType) || normalizeOptionalString(extraction.taxType) || normalizeOptionalString(extraction.taxTreatment) || null,
+        nominalCode: normalizeOptionalString(extraction.nominalCode) || normalizeOptionalString(extraction.selectedNominalCode) || normalizeOptionalString(extraction.accountCode) || null,
+        accountCode: normalizeOptionalString(extraction.accountCode) || normalizeOptionalString(extraction.selectedNominalCode) || normalizeOptionalString(extraction.nominalCode) || null,
+        taxType: normalizeOptionalString(extraction.taxType) || normalizeOptionalString(extraction.selectedTaxType) || normalizeOptionalString(extraction.taxTreatment) || null,
+        taxTreatment: normalizeOptionalString(extraction.taxTreatment) || normalizeOptionalString(extraction.selectedTaxType) || normalizeOptionalString(extraction.taxType) || null,
+        codingReasoning: normalizeOptionalString(extraction.codingReasoning) || null,
+        codingConfidence: typeof extraction.codingConfidence === "number" ? Math.max(0, Math.min(1, extraction.codingConfidence)) : null,
         suggestedTitle: normalizeOptionalString(extraction.suggestedTitle) || "Receipt",
         shortDescription: normalizeOptionalString(extraction.shortDescription) || "Receipt extracted and ready to review.",
         longDescription: normalizeOptionalString(extraction.longDescription) || "Receipt extracted and ready for review.",
-        nominalCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
-        accountCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
-        nominalCodeName: normalizeOptionalString(extraction.selectedNominalCodeName) || null,
-        taxType: normalizeOptionalString(extraction.selectedTaxType) || null,
-        selectedNominalCode: normalizeOptionalString(extraction.selectedNominalCode) || null,
-        selectedNominalCodeName: normalizeOptionalString(extraction.selectedNominalCodeName) || null,
-        selectedTaxType: normalizeOptionalString(extraction.selectedTaxType) || null,
-        codingReasoning: normalizeOptionalString(extraction.codingReasoning) || null,
-        codingConfidence: clampConfidence(extraction.codingConfidence),
         lineItems: Array.isArray(extraction.lineItems)
             ? extraction.lineItems
                 .filter((item) => item && typeof item === "object")
@@ -2672,12 +2682,13 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                     name: normalizeOptionalString(item.name) || "Item",
                     quantity: normalizeOptionalString(item.quantity) || null,
                     amountText: normalizeOptionalString(item.amountText) || null,
-                    nominalCode: normalizeOptionalString(item.nominalCode) || null,
-                    nominalCodeName: normalizeOptionalString(item.nominalCodeName) || null,
-                    taxType: normalizeOptionalString(item.taxType) || null,
+                    nominalCode: normalizeOptionalString(item.nominalCode) || normalizeOptionalString(extraction.selectedNominalCode) || null,
+                    nominalCodeName: normalizeOptionalString(item.nominalCodeName) || normalizeOptionalString(extraction.selectedNominalCodeName) || null,
+                    taxType: normalizeOptionalString(item.taxType) || normalizeOptionalString(extraction.selectedTaxType) || normalizeOptionalString(extraction.taxType) || null,
+                    taxTreatment: normalizeOptionalString(item.taxTreatment) || normalizeOptionalString(item.taxType) || normalizeOptionalString(extraction.selectedTaxType) || null,
                     taxRateText: normalizeOptionalString(item.taxRateText) || null,
-                    codingReasoning: normalizeOptionalString(item.codingReasoning) || null,
-                    codingConfidence: clampConfidence(item.codingConfidence),
+                    codingReasoning: normalizeOptionalString(item.codingReasoning) || normalizeOptionalString(extraction.codingReasoning) || null,
+                    codingConfidence: typeof item.codingConfidence === "number" ? Math.max(0, Math.min(1, item.codingConfidence)) : (typeof extraction.codingConfidence === "number" ? Math.max(0, Math.min(1, extraction.codingConfidence)) : null),
                     requiresReview: Boolean(item.requiresReview)
                 }))
                 .filter((item) => item.name && item.name.length > 1)
@@ -2692,6 +2703,152 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
         needsReview: Boolean(extraction.needsReview),
         extractionConfidence: clampConfidence(extraction.extractionConfidence)
     };
+
+    return applyAccountingSanityChecks(normalizedExtraction, analysisContext);
+}
+
+
+function applyAccountingSanityChecks(extraction, analysisContext = null) {
+    const chartOfAccounts = Array.isArray(analysisContext?.chartOfAccounts)
+        ? analysisContext.chartOfAccounts
+        : [];
+
+    const businessDescription = [
+        analysisContext?.businessType,
+        analysisContext?.industry,
+        analysisContext?.companyName,
+        analysisContext?.clientName,
+        analysisContext?.businessDescription
+    ].map(normalizeOptionalString).join(" ").toLowerCase();
+
+    const textParts = [
+        extraction.merchant,
+        extraction.category,
+        extraction.summary,
+        extraction.shortDescription,
+        extraction.longDescription,
+        extraction.recognizedText,
+        ...(Array.isArray(extraction.extractedLines) ? extraction.extractedLines : []),
+        ...(Array.isArray(extraction.lineItems) ? extraction.lineItems.map((item) => item.name) : [])
+    ].map(normalizeOptionalString).join(" ").toLowerCase();
+
+    const foodKeywords = [
+        "restaurant", "cafe", "café", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
+        "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
+        "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
+        "goujons", "via", "greggs", "mcdonald", "costa", "starbucks", "pret"
+    ];
+
+    const socialKeywords = [
+        "friend", "friends", "guest", "guests", "client lunch", "client dinner", "alcohol",
+        "beer", "wine", "cocktail", "social", "party", "entertainment"
+    ];
+
+    const travelKeywords = [
+        "train", "rail", "national rail", "taxi", "uber", "bolt", "parking", "hotel",
+        "travel", "station", "airport", "bus", "tram"
+    ];
+
+    const softwareKeywords = [
+        "software", "subscription", "saas", "cloud", "hosting", "openai", "microsoft",
+        "google", "adobe", "xero", "dext", "quickbooks"
+    ];
+
+    const fuelKeywords = ["fuel", "petrol", "diesel", "shell", "bp", "esso", "texaco"];
+
+    const isFoodOrDrink = foodKeywords.some((keyword) => textParts.includes(keyword));
+    const hasSocialContext = socialKeywords.some((keyword) => textParts.includes(keyword));
+    const isTravel = travelKeywords.some((keyword) => textParts.includes(keyword));
+    const isSoftware = softwareKeywords.some((keyword) => textParts.includes(keyword));
+    const isFuel = fuelKeywords.some((keyword) => textParts.includes(keyword));
+
+    const totalAmount = typeof extraction.totalAmount === "number" ? extraction.totalAmount : null;
+    const codeName = `${extraction.selectedNominalCode || ""} ${extraction.selectedNominalCodeName || ""} ${extraction.nominalCode || ""} ${extraction.accountCode || ""}`.toLowerCase();
+    const isCostOfGoodsSold = /(^|\D)(310|3100|5000)(\D|$)/.test(codeName) || codeName.includes("cost of goods") || codeName.includes("cost of sales") || codeName.includes("cogs");
+
+    const businessAllowsFoodCOGS =
+        businessDescription.includes("restaurant") ||
+        businessDescription.includes("cafe") ||
+        businessDescription.includes("café") ||
+        businessDescription.includes("food") ||
+        businessDescription.includes("catering") ||
+        businessDescription.includes("hospitality") ||
+        businessDescription.includes("takeaway");
+
+    const receiptSuggestsResale =
+        textParts.includes("wholesale") ||
+        textParts.includes("stock") ||
+        textParts.includes("inventory") ||
+        textParts.includes("resale") ||
+        textParts.includes("ingredients for resale") ||
+        textParts.includes("catering stock");
+
+    if (isFoodOrDrink && isCostOfGoodsSold && !businessAllowsFoodCOGS && !receiptSuggestsResale) {
+        extraction.needsReview = true;
+        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.6, 0.55);
+        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.55, 0.55);
+        extraction.codingReasoning = [
+            "Food or refreshment receipt was blocked from Cost of Goods Sold because there is no evidence the items were bought for resale.",
+            "For a service business this is more likely subsistence, travel, staff welfare, refreshments, or entertainment.",
+            hasSocialContext ? "Social/friends/guest context was detected, so review is required." : "Business purpose is unclear, so review is required."
+        ].filter(Boolean).join(" ");
+
+        extraction.selectedNominalCode = null;
+        extraction.selectedNominalCodeName = null;
+        extraction.nominalCode = null;
+        extraction.accountCode = null;
+
+        if (Array.isArray(extraction.lineItems)) {
+            extraction.lineItems = extraction.lineItems.map((item) => ({
+                ...item,
+                nominalCode: null,
+                nominalCodeName: null,
+                requiresReview: true,
+                codingConfidence: Math.min(item.codingConfidence ?? 0.55, 0.55),
+                codingReasoning: "Food/refreshment item should not be posted to Cost of Goods Sold unless purchased for resale. Review business purpose before posting."
+            }));
+        }
+    }
+
+    if (isFoodOrDrink && totalAmount != null && totalAmount < 30 && !businessAllowsFoodCOGS && !receiptSuggestsResale) {
+        extraction.needsReview = true;
+        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.65, hasSocialContext ? 0.5 : 0.7);
+        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.7, hasSocialContext ? 0.55 : 0.75);
+
+        if (!extraction.codingReasoning) {
+            extraction.codingReasoning = hasSocialContext
+                ? "Low-value food/drink receipt with possible social context. Treat as subsistence, staff welfare, refreshments, or entertainment only after review."
+                : "Low-value food/drink receipt. This is usually subsistence, staff welfare, refreshments, or travel-related expense rather than Cost of Goods Sold.";
+        }
+    }
+
+    if (hasSocialContext) {
+        extraction.needsReview = true;
+        extraction.codingConfidence = Math.min(extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.55, 0.55);
+        extraction.extractionConfidence = Math.min(extraction.extractionConfidence || 0.6, 0.6);
+    }
+
+    if (isTravel && !isFoodOrDrink) {
+        extraction.category = extraction.category || "Travel";
+    }
+
+    if (isSoftware) {
+        extraction.category = extraction.category || "Software";
+    }
+
+    if (isFuel) {
+        extraction.category = extraction.category || "Motor expenses";
+    }
+
+    if (Array.isArray(extraction.lineItems)) {
+        extraction.lineItems = extraction.lineItems.map((item) => ({
+            ...item,
+            taxTreatment: normalizeOptionalString(item.taxTreatment) || normalizeOptionalString(item.taxType) || normalizeOptionalString(extraction.taxTreatment) || null,
+            codingConfidence: typeof item.codingConfidence === "number" ? Math.max(0, Math.min(1, item.codingConfidence)) : extraction.codingConfidence
+        }));
+    }
+
+    return extraction;
 }
 
 function buildXeroCodingInstructions(analysisContext) {
