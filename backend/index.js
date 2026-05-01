@@ -2277,7 +2277,6 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt }) {
                         "needsReview",
                         "extractionConfidence"
                     ]
-                }
             }
         }
     };
