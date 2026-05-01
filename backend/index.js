@@ -3153,14 +3153,158 @@ function applyAccountingIntelligence(extraction, analysisContext = null) {
         ? "One or more line items require review because the coding confidence was below the auto-posting threshold."
         : "Coding selected using chart-of-accounts matching, business-context rules and receipt line-item analysis.");
 
+    // Final auto-posting compatibility guard.
+    // The mobile app requires a complete Xero coding payload every time.
+    // We therefore avoid returning an incomplete extraction just because the AI was cautious.
+    normalizedExtraction.lineItemsWithAICoding = buildCompleteAutoCodingLines({
+        extraction: normalizedExtraction,
+        chartOfAccounts,
+        fallbackAccount: generalCode
+    });
+    normalizedExtraction.lineItems = normalizedExtraction.lineItemsWithAICoding;
+
+    const completedLineCodes = [...new Set(
+        normalizedExtraction.lineItemsWithAICoding
+            .map((item) => normalizeOptionalString(item.nominalCode || item.accountCode))
+            .filter(Boolean)
+    )];
+
+    if (completedLineCodes.length === 1) {
+        const line = normalizedExtraction.lineItemsWithAICoding[0];
+        normalizedExtraction.selectedNominalCode = line.nominalCode;
+        normalizedExtraction.selectedNominalCodeName = line.nominalCodeName;
+        normalizedExtraction.nominalCode = line.nominalCode;
+        normalizedExtraction.accountCode = line.nominalCode;
+        normalizedExtraction.category = line.nominalCodeName || normalizedExtraction.category;
+    } else if (completedLineCodes.length > 1) {
+        normalizedExtraction.selectedNominalCode = null;
+        normalizedExtraction.selectedNominalCodeName = "Mixed expense categories";
+        normalizedExtraction.nominalCode = null;
+        normalizedExtraction.accountCode = null;
+        normalizedExtraction.category = "Mixed expenses";
+    }
+
+    const firstCompletedLine = normalizedExtraction.lineItemsWithAICoding[0] || {};
+    normalizedExtraction.taxType = normalizeOptionalString(normalizedExtraction.taxType)
+        || normalizeOptionalString(normalizedExtraction.selectedTaxType)
+        || normalizeOptionalString(firstCompletedLine.taxType)
+        || "No VAT";
+    normalizedExtraction.selectedTaxType = normalizeOptionalString(normalizedExtraction.selectedTaxType)
+        || normalizedExtraction.taxType;
+    normalizedExtraction.taxTreatment = normalizeOptionalString(normalizedExtraction.taxTreatment)
+        || normalizeOptionalString(firstCompletedLine.taxTreatment)
+        || normalizedExtraction.taxType
+        || "No VAT";
+
+    normalizedExtraction.codingConfidence = clampConfidenceValue(
+        normalizedExtraction.codingConfidence ?? averageLineConfidence(normalizedExtraction.lineItemsWithAICoding) ?? normalizedExtraction.extractionConfidence
+    );
     normalizedExtraction.extractionConfidence = clampConfidenceValue(normalizedExtraction.extractionConfidence);
-    normalizedExtraction.codingConfidence = clampConfidenceValue(normalizedExtraction.codingConfidence ?? normalizedExtraction.extractionConfidence);
+
+    // Product requirement: extraction should proceed automatically. Low confidence is exposed in
+    // codingConfidence/codingExplanation, but does not block posting.
+    normalizedExtraction.needsReview = false;
+    normalizedExtraction.lineItemsWithAICoding = normalizedExtraction.lineItemsWithAICoding.map((item) => ({
+        ...item,
+        requiresReview: false
+    }));
+    normalizedExtraction.lineItems = normalizedExtraction.lineItemsWithAICoding;
 
     return normalizedExtraction;
 }
 
 function applyAccountingSanityChecks(extraction, analysisContext = null) {
     return applyAccountingIntelligence(extraction, analysisContext);
+}
+
+function buildCompleteAutoCodingLines({ extraction, chartOfAccounts, fallbackAccount }) {
+    const existingLines = Array.isArray(extraction.lineItemsWithAICoding) && extraction.lineItemsWithAICoding.length > 0
+        ? extraction.lineItemsWithAICoding
+        : (Array.isArray(extraction.lineItems) ? extraction.lineItems : []);
+
+    const fallbackCode = normalizeOptionalString(extraction.nominalCode || extraction.accountCode || extraction.selectedNominalCode)
+        || normalizeOptionalString(fallbackAccount?.code)
+        || "429";
+    const fallbackName = normalizeOptionalString(extraction.selectedNominalCodeName || extraction.category || fallbackAccount?.name)
+        || "General Expenses";
+    const fallbackMatchedAccount = findAccountByCodeOrName(chartOfAccounts, fallbackCode, fallbackName) || fallbackAccount || {
+        code: fallbackCode,
+        name: fallbackName,
+        taxType: "No VAT"
+    };
+    const fallbackTax = normalizeOptionalString(extraction.taxTreatment || extraction.taxType || extraction.selectedTaxType || fallbackMatchedAccount.taxType)
+        || inferFallbackTaxTreatment(extraction)
+        || "No VAT";
+
+    const sourceLines = existingLines.length > 0 ? existingLines : [
+        {
+            name: normalizeOptionalString(extraction.shortDescription)
+                || normalizeOptionalString(extraction.summary)
+                || normalizeOptionalString(extraction.merchant)
+                || "Receipt",
+            quantity: "1",
+            amountText: normalizeOptionalString(extraction.totalText)
+                || (typeof extraction.totalAmount === "number" ? String(extraction.totalAmount) : null),
+            nominalCode: fallbackMatchedAccount.code,
+            nominalCodeName: fallbackMatchedAccount.name,
+            accountCode: fallbackMatchedAccount.code,
+            taxType: fallbackTax,
+            taxTreatment: fallbackTax,
+            taxRateText: null,
+            codingReasoning: normalizeOptionalString(extraction.codingReasoning)
+                || "Automatic fallback line created because the document did not contain separable line items.",
+            codingConfidence: Math.min(extraction.codingConfidence || extraction.extractionConfidence || 0.62, 0.72),
+            requiresReview: false
+        }
+    ];
+
+    return sourceLines.map((item) => {
+        const code = normalizeOptionalString(item.nominalCode || item.accountCode || fallbackMatchedAccount.code) || "429";
+        const name = normalizeOptionalString(item.nominalCodeName || item.accountName || fallbackMatchedAccount.name) || "General Expenses";
+        const matchedAccount = findAccountByCodeOrName(chartOfAccounts, code, name) || { code, name, taxType: fallbackTax };
+        const tax = normalizeOptionalString(item.taxTreatment || item.taxType || extraction.taxTreatment || extraction.taxType || matchedAccount.taxType)
+            || inferFallbackTaxTreatment(extraction)
+            || "No VAT";
+
+        return {
+            ...item,
+            name: normalizeOptionalString(item.name) || normalizeOptionalString(extraction.merchant) || "Receipt line item",
+            quantity: normalizeOptionalString(item.quantity) || "1",
+            amountText: normalizeOptionalString(item.amountText)
+                || normalizeOptionalString(extraction.totalText)
+                || (typeof extraction.totalAmount === "number" ? String(extraction.totalAmount) : null),
+            nominalCode: matchedAccount.code || code,
+            nominalCodeName: matchedAccount.name || name,
+            accountCode: matchedAccount.code || code,
+            taxType: tax,
+            taxTreatment: tax,
+            taxRateText: normalizeOptionalString(item.taxRateText) || null,
+            codingReasoning: normalizeOptionalString(item.codingReasoning)
+                || normalizeOptionalString(extraction.codingReasoning)
+                || "Automatically coded using chart-of-accounts rules and available document context.",
+            codingConfidence: clampConfidenceValue(
+                typeof item.codingConfidence === "number"
+                    ? item.codingConfidence
+                    : (extraction.codingConfidence ?? extraction.extractionConfidence ?? 0.65)
+            ),
+            requiresReview: false
+        };
+    });
+}
+
+function inferFallbackTaxTreatment(extraction) {
+    const recognizedText = normalizeComparableWords(extraction?.recognizedText || "");
+    const vatAmount = typeof extraction?.vatAmount === "number" ? extraction.vatAmount : null;
+
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat £0")) {
+        return "No VAT";
+    }
+
+    if (vatAmount != null && vatAmount > 0) {
+        return "20% (VAT on Expenses)";
+    }
+
+    return "No VAT";
 }
 
 function normalizeChartOfAccountsForCoding(chartOfAccounts) {
