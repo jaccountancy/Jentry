@@ -19,7 +19,10 @@ const requiredEnvironmentVariables = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
     "GOOGLE_REFRESH_TOKEN",
-    "GMAIL_SENDER"
+    "GMAIL_SENDER",
+    "DATABASE_URL",
+    "XERO_CLIENT_ID",
+    "XERO_CLIENT_SECRET"
 ];
 
 const optionalEnvironmentVariables = {
@@ -763,7 +766,7 @@ app.post(
             const result = await handleEmailUpload(metadata, documentFiles);
             response.json(result);
         } catch (error) {
-            const message = error instanceof Error ? error.message : "Unknown server error.";
+            const message = error instanceof Error ? error.message : "Unknown backend error.";
             console.error("Upload processing failed.", {
                 message,
                 stack: error instanceof Error ? error.stack : undefined
