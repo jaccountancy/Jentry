@@ -184,15 +184,6 @@ const pool = new Pool({
 });
 
 
-const SERVER_SUPER_ADMIN_EMAILS = new Set([
-    "jay@jaccountancy.co.uk",
-    "amie@jaccountancy.co.uk",
-    ...String(process.env.JENTRY_SUPER_ADMIN_EMAILS || "")
-        .split(",")
-        .map((email) => normalizeEmail(email))
-        .filter(Boolean)
-]);
-
 const SUSPENDED_ACCOUNT_ERROR = {
     code: "ACCOUNT_SUSPENDED",
     message: "Suspended. Please contact Jaccountancy."
@@ -228,7 +219,6 @@ async function getOrCreateAuthenticatedUser(request) {
     if (!email) return null;
 
     await ensureCoreModelTables();
-    await ensureServerSuperAdmins();
 
     const displayName = normalizeOptionalString(
         request.headers["x-user-display-name"] ||
@@ -239,11 +229,10 @@ async function getOrCreateAuthenticatedUser(request) {
     const result = await pool.query(
         `
         INSERT INTO users (email, display_name, role, is_super_admin, last_seen_at, last_login_at, updated_at)
-        VALUES ($1, $2, $3, $4, now(), COALESCE($5::timestamptz, now()), now())
+        VALUES ($1, $2, 'user', false, now(), COALESCE($3::timestamptz, now()), now())
         ON CONFLICT (email)
         DO UPDATE SET
             display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
-            is_super_admin = CASE WHEN LOWER(users.email) = ANY($6::text[]) THEN true ELSE users.is_super_admin END,
             last_seen_at = now(),
             updated_at = now()
         RETURNING *
@@ -251,10 +240,7 @@ async function getOrCreateAuthenticatedUser(request) {
         [
             email,
             displayName,
-            SERVER_SUPER_ADMIN_EMAILS.has(email) ? "super_admin" : "user",
-            SERVER_SUPER_ADMIN_EMAILS.has(email),
-            request.headers["x-login-event"] ? new Date().toISOString() : null,
-            [...SERVER_SUPER_ADMIN_EMAILS]
+            request.headers["x-login-event"] ? new Date().toISOString() : null
         ]
     );
 
@@ -304,7 +290,7 @@ function requireSuperAdmin(request, response, next) {
     const headerEmail = normalizeEmail(request.header("X-Jentry-Super-Admin-Email"));
     const authenticatedEmail = normalizeEmail(request.authenticatedUser?.email);
 
-    if (!headerEmail || headerEmail !== authenticatedEmail || !SERVER_SUPER_ADMIN_EMAILS.has(authenticatedEmail)) {
+    if (!headerEmail || headerEmail !== authenticatedEmail || !request.authenticatedUser?.isSuperAdmin) {
         response.status(403).json({ message: "Forbidden" });
         return;
     }
@@ -1651,23 +1637,6 @@ async function ensureCoreModelTables() {
             created_at timestamptz NOT NULL DEFAULT now()
         )
     `);
-
-    await ensureServerSuperAdmins();
-}
-
-async function ensureServerSuperAdmins() {
-    if (!SERVER_SUPER_ADMIN_EMAILS.size) return;
-    for (const email of SERVER_SUPER_ADMIN_EMAILS) {
-        await pool.query(
-            `
-            INSERT INTO users (email, display_name, role, is_super_admin, created_at, updated_at)
-            VALUES ($1, $2, 'super_admin', true, now(), now())
-            ON CONFLICT (email)
-            DO UPDATE SET is_super_admin = true, role = 'super_admin', updated_at = now()
-            `,
-            [email, email]
-        );
-    }
 }
 
 async function upsertAccountRecord({ accountId, clientId = null, companyName = null, natureOfBusiness = null, isVatRegistered = null, status = null, assignedUserId = null, clientEmail = null } = {}) {
@@ -1925,7 +1894,7 @@ async function setWorkspaceSuspension({ accountId, isSuspended, reason = null, a
             reason: normalizedReason,
             beforeSummary,
             afterSummary: nextSuspended
-                ? `Suspended${normalizedReason ? ` â€¢ ${normalizedReason}` : ""}`
+                ? `Suspended${normalizedReason ? ` • ${normalizedReason}` : ""}`
                 : "Active",
             detail: nextSuspended
                 ? `${companyName} was suspended and will be blocked on next access.`
@@ -2006,8 +1975,8 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
             category: "registry",
             actionTitle: "Updated workspace registry",
             targetName,
-            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" â€¢ ") || "No registry record",
-            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" â€¢ "),
+            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" • ") || "No registry record",
+            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" • "),
             detail: `${targetName} registry details were updated.`
         }
     });
@@ -3104,7 +3073,7 @@ function buildMatchSummary(candidate, score) {
         `match score ${score}`
     ].filter(Boolean);
 
-    return fragments.join(" â€¢ ");
+    return fragments.join(" • ");
 }
 
 function normalizeComparableText(value) {
@@ -3867,7 +3836,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern 'Â£11.58 â€“ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
+                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
                             codingInstructions.systemInstruction,
                             "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
@@ -4675,7 +4644,7 @@ function inferFallbackTaxTreatment(extraction) {
     const recognizedText = normalizeComparableWords(extraction?.recognizedText || "");
     const vatAmount = typeof extraction?.vatAmount === "number" ? extraction.vatAmount : null;
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat Â£0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat £0")) {
         return "No VAT";
     }
 
@@ -4915,7 +4884,7 @@ function normalizeComparableWords(value) {
     return normalizeOptionalString(value)
         .toLowerCase()
         .replace(/&/g, " and ")
-        .replace(/[^a-z0-9Â£.\s-]/g, " ")
+        .replace(/[^a-z0-9£.\s-]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -4923,7 +4892,7 @@ function normalizeComparableWords(value) {
 function detectFoodDrinkContext(text) {
     const normalized = normalizeComparableWords(text);
     const keywords = [
-        "restaurant", "cafe", "cafÃ©", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
+        "restaurant", "cafe", "café", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
         "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
         "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
         "goujons", "greggs", "mcdonald", "mcdonalds", "costa", "starbucks", "pret",
@@ -5053,7 +5022,7 @@ function chooseTaxTreatment({
         return { taxType: existing, taxTreatment: existing };
     }
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat Â£0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat £0")) {
         return { taxType: "No VAT", taxTreatment: "No VAT" };
     }
 
