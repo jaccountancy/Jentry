@@ -343,12 +343,21 @@ async function requireActiveUserOrXeroStartToken(request, response, next) {
 }
 
 function extractAuthenticatedEmail(request) {
+    // Prefer a real authenticated identity from the platform/proxy/JWT.
+    // Keep x-user-email for backwards compatibility, but production should not rely on it.
     const directEmail = normalizeEmail(
-        request.headers["x-user-email"] ||
         request.headers["x-authenticated-user-email"] ||
         request.headers["x-jentry-user-email"] ||
+        request.headers["x-forwarded-email"] ||
+        request.headers["x-ms-client-principal-name"] ||
+        request.headers["cf-access-authenticated-user-email"] ||
+        stripGoogleAuthenticatedUserPrefix(request.headers["x-goog-authenticated-user-email"]) ||
+        request.headers["x-user-email"] ||
+        request.body?.authenticatedUserEmail ||
+        request.body?.connectedUserEmail ||
         request.body?.userEmail ||
         request.body?.submittedByEmail ||
+        request.query?.authenticatedUserEmail ||
         request.query?.userEmail ||
         request.query?.connectedUserEmail
     );
@@ -360,7 +369,20 @@ function extractAuthenticatedEmail(request) {
         ? authorization.slice(7).trim()
         : "";
     const claims = parseJWTPayload(token);
-    return normalizeEmail(claims?.email || claims?.preferred_username || claims?.upn);
+    return normalizeEmail(
+        claims?.email ||
+        claims?.preferred_username ||
+        claims?.upn ||
+        claims?.unique_name ||
+        claims?.user_email
+    );
+}
+
+function stripGoogleAuthenticatedUserPrefix(value) {
+    const normalized = normalizeOptionalString(value);
+    if (!normalized) return "";
+
+    return normalized.replace(/^accounts\.google\.com:/i, "");
 }
 
 async function getOrCreateAuthenticatedUser(request) {
