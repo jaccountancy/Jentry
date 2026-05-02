@@ -19,7 +19,10 @@ const requiredEnvironmentVariables = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
     "GOOGLE_REFRESH_TOKEN",
-    "GMAIL_SENDER"
+    "GMAIL_SENDER",
+    "DATABASE_URL",
+    "XERO_CLIENT_ID",
+    "XERO_CLIENT_SECRET"
 ];
 
 const optionalEnvironmentVariables = {
