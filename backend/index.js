@@ -394,13 +394,29 @@ app.get("/oauth/xero/start", async (request, response) => {
 
 app.get("/oauth/xero/callback", async (request, response) => {
     const state = normalizeOptionalString(request.query.state);
+    const code = normalizeOptionalString(request.query.code);
     let authSession = null;
     let fallbackReturnURL = xeroAppRedirectURI();
+    let tokenExchangeSucceeded = false;
+    let tokensStored = false;
 
     try {
         authSession = state ? await getXeroAuthSession(state) : null;
         fallbackReturnURL = authSession?.returnUri || xeroAppRedirectURI();
+
+        console.log("Xero OAuth callback received.", {
+            accountId: authSession?.accountId || null,
+            state: state || null,
+            hasCode: Boolean(code),
+            codePreview: code ? `${code.slice(0, 6)}...` : null
+        });
+
         if (!authSession) {
+            console.warn("Xero OAuth callback rejected: missing or expired auth session.", {
+                state: state || null,
+                hasCode: Boolean(code)
+            });
+
             response.redirect(
                 buildReturnURL(fallbackReturnURL, {
                     status: "error",
@@ -414,6 +430,12 @@ app.get("/oauth/xero/callback", async (request, response) => {
 
         const authError = normalizeOptionalString(request.query.error);
         if (authError) {
+            console.warn("Xero OAuth callback returned an authorization error.", {
+                accountId: authSession.accountId,
+                state: state || null,
+                authError
+            });
+
             response.redirect(
                 buildReturnURL(authSession.returnUri, {
                     accountId: authSession.accountId,
@@ -424,8 +446,12 @@ app.get("/oauth/xero/callback", async (request, response) => {
             return;
         }
 
-        const code = normalizeOptionalString(request.query.code);
         if (!code) {
+            console.warn("Xero OAuth callback rejected: authorization code missing.", {
+                accountId: authSession.accountId,
+                state: state || null
+            });
+
             response.redirect(
                 buildReturnURL(authSession.returnUri, {
                     accountId: authSession.accountId,
@@ -443,6 +469,15 @@ app.get("/oauth/xero/callback", async (request, response) => {
             code,
             redirect_uri: xeroRedirectURI(),
             code_verifier: authSession.verifier
+        });
+        tokenExchangeSucceeded = Boolean(tokenData.access_token);
+
+        console.log("Xero OAuth token exchange completed.", {
+            accountId: authSession.accountId,
+            tokenExchangeSucceeded,
+            hasAccessToken: Boolean(tokenData.access_token),
+            hasRefreshToken: Boolean(tokenData.refresh_token),
+            expiresIn: tokenData.expires_in || null
         });
 
         const connectedUserEmail = extractConnectedUserEmail(tokenData.id_token);
@@ -469,6 +504,16 @@ app.get("/oauth/xero/callback", async (request, response) => {
             chartOfAccounts,
             chartOfAccountsLastSyncedAt: selectedTenant ? new Date().toISOString() : null
         }));
+        tokensStored = true;
+
+        console.log("Xero OAuth callback completed and tokens stored.", {
+            accountId: authSession.accountId,
+            tokenExchangeSucceeded,
+            tokensStored,
+            tenantCount: tenants.length,
+            selectedTenantId: selectedTenant?.tenantId || null,
+            connectedUserEmail: connectedUserEmail || null
+        });
 
         response.redirect(
             buildReturnURL(authSession.returnUri, {
@@ -479,6 +524,18 @@ app.get("/oauth/xero/callback", async (request, response) => {
         );
     } catch (error) {
         const message = error instanceof Error ? error.message : "Xero connection failed.";
+
+        console.error("Xero OAuth callback failed.", {
+            accountId: authSession?.accountId || null,
+            state: state || null,
+            hasCode: Boolean(code),
+            codePreview: code ? `${code.slice(0, 6)}...` : null,
+            tokenExchangeSucceeded,
+            tokensStored,
+            message,
+            stack: error instanceof Error ? error.stack : undefined
+        });
+
         response.redirect(
             buildReturnURL(fallbackReturnURL, {
                 accountId: authSession?.accountId || "",
