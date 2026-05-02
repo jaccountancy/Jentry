@@ -311,6 +311,75 @@ function requireSuperAdmin(request, response, next) {
     next();
 }
 
+async function requireAuthorizedAccountAccess(request, response, accountId, { allowCreate = false } = {}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    if (!normalizedAccountId) {
+        response.status(400).json({ code: "ACCOUNT_ID_REQUIRED", message: "Missing accountId." });
+        return false;
+    }
+
+    const user = request.authenticatedUser;
+    if (!user) {
+        response.status(401).json({ code: "AUTH_REQUIRED", message: "Authentication required." });
+        return false;
+    }
+
+    if (user.isSuperAdmin) {
+        return true;
+    }
+
+    await ensureCoreModelTables();
+
+    const result = await pool.query(
+        `
+        SELECT
+            a.id AS account_id,
+            a.assigned_user_id,
+            a.status,
+            m.user_id AS member_user_id
+        FROM accounts a
+        LEFT JOIN memberships m
+            ON m.account_id = a.id
+           AND m.user_id = $2
+        WHERE a.id = $1
+        LIMIT 1
+        `,
+        [normalizedAccountId, user.id]
+    );
+
+    const account = result.rows[0] || null;
+
+    if (!account) {
+        if (!allowCreate) {
+            response.status(403).json({ code: "ACCOUNT_FORBIDDEN", message: "You are not authorised to access this account." });
+            return false;
+        }
+
+        await upsertAccountRecord({
+            accountId: normalizedAccountId,
+            assignedUserId: user.id,
+            clientEmail: user.email
+        });
+        await pool.query(
+            `INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, 'owner') ON CONFLICT (user_id, account_id) DO NOTHING`,
+            [user.id, normalizedAccountId]
+        );
+        return true;
+    }
+
+    if (account.status === "suspended") {
+        sendSuspendedResponse(response);
+        return false;
+    }
+
+    if (account.assigned_user_id === user.id || account.member_user_id === user.id) {
+        return true;
+    }
+
+    response.status(403).json({ code: "ACCOUNT_FORBIDDEN", message: "You are not authorised to access this account." });
+    return false;
+}
+
 app.get("/health", (_request, response) => {
     console.log("Health check received.");
     response.json({ ok: true });
@@ -352,7 +421,7 @@ app.use([
     "/jentry/problem-report"
 ], requireActiveUser);
 
-app.get("/oauth/xero/start", async (request, response) => {
+app.get("/oauth/xero/start", requireActiveUser, async (request, response) => {
     try {
         if (!xeroConfigured()) {
             response.status(500).json({ message: "Xero OAuth is not configured on the backend." });
@@ -362,6 +431,10 @@ app.get("/oauth/xero/start", async (request, response) => {
         const accountId = normalizeOptionalString(request.query.accountId);
         if (!accountId) {
             response.status(400).json({ message: "Missing accountId." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: true })) {
             return;
         }
 
@@ -554,6 +627,10 @@ app.get("/xero/status", async (request, response) => {
             return;
         }
 
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+            return;
+        }
+
         const connection = await ensureFreshXeroConnection(accountId);
 
         response.json({
@@ -586,6 +663,10 @@ app.get("/xero/tenants", async (request, response) => {
             return;
         }
 
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+            return;
+        }
+
         const connection = await ensureFreshXeroConnection(accountId);
         response.json({
             tenants: connection.tenants || [],
@@ -605,6 +686,10 @@ app.post("/xero/select-tenant", async (request, response) => {
 
         if (!accountId || !tenantId) {
             response.status(400).json({ message: "Missing accountId or tenantId." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
             return;
         }
 
@@ -644,6 +729,10 @@ app.post("/xero/disconnect", async (request, response) => {
             return;
         }
 
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+            return;
+        }
+
         await deleteXeroConnection(accountId);
         response.json({ disconnected: true, connectedUserEmail: null });
     } catch (error) {
@@ -656,6 +745,10 @@ app.get("/xero/accounts", async (request, response) => {
         const accountId = normalizeOptionalString(request.query.accountId);
         if (!accountId) {
             response.status(400).json({ message: "Missing accountId." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
             return;
         }
 
@@ -699,6 +792,10 @@ app.post("/xero/match-transactions", async (request, response) => {
             return;
         }
 
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+            return;
+        }
+
         const connection = await ensureFreshXeroConnection(accountId);
         if (!connection.selectedTenantId) {
             sendXeroError(response, new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
@@ -737,6 +834,10 @@ app.post("/xero/publish-bill", upload.any(), async (request, response) => {
 
         if (!accountId) {
             response.status(400).json({ message: "Missing accountId." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
             return;
         }
 
@@ -805,6 +906,10 @@ app.post(
                 const accountId = normalizeOptionalString(metadata.accountId || metadata.accountID);
                 if (!accountId) {
                     throw new Error("Missing accountId for Xero-integrated submission.");
+                }
+
+                if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+                    return;
                 }
 
                 const result = await createXeroLedgerDocument(accountId, metadata, documentFiles);
@@ -881,6 +986,10 @@ app.post(
                 return;
             }
 
+            if (!await requireAuthorizedAccountAccess(request, response, accountId)) {
+                return;
+            }
+
             if (documentFiles.length === 0) {
                 response.status(400).json({ message: "Missing documents[]." });
                 return;
@@ -925,6 +1034,10 @@ app.post("/jentry/inbox/register", async (request, response) => {
 
         if (!accountId || !inboxEmail) {
             response.status(400).json({ message: "Missing accountId or inboxEmail." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: true })) {
             return;
         }
 
@@ -1000,6 +1113,10 @@ app.get("/inbound-email-submissions", async (request, response) => {
         const whereClause = conditions.length > 0
             ? `WHERE ${conditions.join(" AND ")}`
             : "";
+
+        if (accountId && !await requireAuthorizedAccountAccess(request, response, accountId)) {
+            return;
+        }
 
         const result = await pool.query(
             `
@@ -1107,6 +1224,10 @@ app.get("/xero/contacts", async (req, res) => {
             return;
         }
 
+        if (!await requireAuthorizedAccountAccess(req, res, accountId)) {
+            return;
+        }
+
         const connection = await ensureFreshXeroConnection(accountId);
         if (!connection.selectedTenantId) {
             sendXeroError(res, new XeroAPIError({ message: "No Xero tenant selected.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false }));
@@ -1136,10 +1257,14 @@ app.get("/xero/contacts", async (req, res) => {
 app.post("/xero/ensure-contact", async (req, res) => {
     try {
         const accountId = normalizeOptionalString(req.body?.accountId);
-        const contactName = normalizeOptionalString(req.body?.contactName);
+        const contactName = normalizeOptionalString(req.body?.contactName || req.body?.supplierName);
 
         if (!accountId || !contactName) {
-            res.status(400).json({ message: "Missing accountId or contactName." });
+            res.status(400).json({ message: "Missing accountId and contactName or supplierName." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(req, res, accountId)) {
             return;
         }
 
