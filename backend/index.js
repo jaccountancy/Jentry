@@ -19,10 +19,7 @@ const requiredEnvironmentVariables = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
     "GOOGLE_REFRESH_TOKEN",
-    "GMAIL_SENDER",
-    "DATABASE_URL",
-    "XERO_CLIENT_ID",
-    "XERO_CLIENT_SECRET"
+    "GMAIL_SENDER"
 ];
 
 const optionalEnvironmentVariables = {
@@ -1928,7 +1925,7 @@ async function setWorkspaceSuspension({ accountId, isSuspended, reason = null, a
             reason: normalizedReason,
             beforeSummary,
             afterSummary: nextSuspended
-                ? `Suspended${normalizedReason ? ` • ${normalizedReason}` : ""}`
+                ? `Suspended${normalizedReason ? ` â€¢ ${normalizedReason}` : ""}`
                 : "Active",
             detail: nextSuspended
                 ? `${companyName} was suspended and will be blocked on next access.`
@@ -2009,8 +2006,8 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
             category: "registry",
             actionTitle: "Updated workspace registry",
             targetName,
-            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" • ") || "No registry record",
-            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" • "),
+            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" â€¢ ") || "No registry record",
+            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" â€¢ "),
             detail: `${targetName} registry details were updated.`
         }
     });
@@ -3107,7 +3104,7 @@ function buildMatchSummary(candidate, score) {
         `match score ${score}`
     ].filter(Boolean);
 
-    return fragments.join(" • ");
+    return fragments.join(" â€¢ ");
 }
 
 function normalizeComparableText(value) {
@@ -3870,7 +3867,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
+                            "The suggested title should be concise and usually follow the pattern 'Â£11.58 â€“ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
                             codingInstructions.systemInstruction,
                             "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
@@ -4678,7 +4675,7 @@ function inferFallbackTaxTreatment(extraction) {
     const recognizedText = normalizeComparableWords(extraction?.recognizedText || "");
     const vatAmount = typeof extraction?.vatAmount === "number" ? extraction.vatAmount : null;
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat £0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat Â£0")) {
         return "No VAT";
     }
 
@@ -4918,7 +4915,7 @@ function normalizeComparableWords(value) {
     return normalizeOptionalString(value)
         .toLowerCase()
         .replace(/&/g, " and ")
-        .replace(/[^a-z0-9£.\s-]/g, " ")
+        .replace(/[^a-z0-9Â£.\s-]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -4926,7 +4923,7 @@ function normalizeComparableWords(value) {
 function detectFoodDrinkContext(text) {
     const normalized = normalizeComparableWords(text);
     const keywords = [
-        "restaurant", "cafe", "café", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
+        "restaurant", "cafe", "cafÃ©", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
         "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
         "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
         "goujons", "greggs", "mcdonald", "mcdonalds", "costa", "starbucks", "pret",
@@ -5056,7 +5053,7 @@ function chooseTaxTreatment({
         return { taxType: existing, taxTreatment: existing };
     }
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat £0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat Â£0")) {
         return { taxType: "No VAT", taxTreatment: "No VAT" };
     }
 
