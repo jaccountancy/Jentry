@@ -333,7 +333,6 @@ app.post("/session/heartbeat", requireActiveUser, async (request, response) => {
 });
 
 app.use([
-    "/oauth/xero/start",
     "/xero/status",
     "/xero/tenants",
     "/xero/select-tenant",
