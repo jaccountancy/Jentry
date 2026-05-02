@@ -203,6 +203,145 @@ function sendSuspendedResponse(response) {
     response.status(403).json(SUSPENDED_ACCOUNT_ERROR);
 }
 
+const XERO_OAUTH_START_TOKEN_TTL_MS = Number(process.env.XERO_OAUTH_START_TOKEN_TTL_MS || 10 * 60 * 1000);
+
+function xeroOAuthStartTokenSecret() {
+    return normalizeOptionalString(
+        process.env.JENTRY_AUTH_TOKEN_SECRET ||
+        process.env.XERO_OAUTH_START_TOKEN_SECRET ||
+        process.env.XERO_CLIENT_SECRET ||
+        process.env.GOOGLE_CLIENT_SECRET
+    );
+}
+
+function signXeroOAuthStartTokenPayload(encodedPayload) {
+    const secret = xeroOAuthStartTokenSecret();
+    if (!secret) {
+        throw new Error("Missing Xero OAuth start token secret.");
+    }
+
+    return toBase64Url(crypto.createHmac("sha256", secret).update(encodedPayload).digest());
+}
+
+function createXeroOAuthStartToken({ email, displayName = "", accountId = "" } = {}) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) {
+        throw new Error("Missing authenticated email for Xero OAuth start token.");
+    }
+
+    const payload = {
+        email: normalizedEmail,
+        displayName: normalizeOptionalString(displayName) || normalizedEmail,
+        accountId: normalizeOptionalString(accountId) || null,
+        issuedAt: Date.now(),
+        expiresAt: Date.now() + XERO_OAUTH_START_TOKEN_TTL_MS,
+        nonce: crypto.randomUUID()
+    };
+
+    const encodedPayload = toBase64Url(JSON.stringify(payload));
+    const signature = signXeroOAuthStartTokenPayload(encodedPayload);
+    return `${encodedPayload}.${signature}`;
+}
+
+function verifyXeroOAuthStartToken(token) {
+    const normalizedToken = normalizeOptionalString(token);
+    if (!normalizedToken) return null;
+
+    const [encodedPayload, signature] = normalizedToken.split(".");
+    if (!encodedPayload || !signature) return null;
+
+    const expectedSignature = signXeroOAuthStartTokenPayload(encodedPayload);
+    const signatureBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
+        return null;
+    }
+
+    try {
+        const paddedPayload = encodedPayload.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (encodedPayload.length % 4)) % 4);
+        const payload = JSON.parse(Buffer.from(paddedPayload, "base64").toString("utf8"));
+
+        if (!payload?.expiresAt || Date.now() > Number(payload.expiresAt)) {
+            return null;
+        }
+
+        const email = normalizeEmail(payload.email);
+        if (!email) return null;
+
+        return {
+            email,
+            displayName: normalizeOptionalString(payload.displayName) || email,
+            accountId: normalizeOptionalString(payload.accountId) || null
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function getOrCreateUserFromEmail({ email, displayName = "", loginEvent = false } = {}) {
+    const normalizedEmail = normalizeEmail(email);
+    if (!normalizedEmail) return null;
+
+    await ensureCoreModelTables();
+
+    const result = await pool.query(
+        `
+        INSERT INTO users (email, display_name, role, is_super_admin, last_seen_at, last_login_at, updated_at)
+        VALUES ($1, $2, 'user', $4, now(), COALESCE($3::timestamptz, now()), now())
+        ON CONFLICT (email)
+        DO UPDATE SET
+            display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
+            is_super_admin = users.is_super_admin OR EXCLUDED.is_super_admin,
+            last_seen_at = now(),
+            updated_at = now()
+        RETURNING *
+        `,
+        [
+            normalizedEmail,
+            normalizeOptionalString(displayName) || normalizedEmail,
+            loginEvent ? new Date().toISOString() : null,
+            SERVER_SUPER_ADMIN_EMAILS.has(normalizedEmail)
+        ]
+    );
+
+    return mapUserRow(result.rows[0]);
+}
+
+async function requireActiveUserOrXeroStartToken(request, response, next) {
+    const tokenPayload = verifyXeroOAuthStartToken(request.query?.xeroAuthToken || request.query?.authToken || request.query?.token);
+
+    if (tokenPayload) {
+        const requestedAccountId = normalizeOptionalString(request.query?.accountId);
+        if (tokenPayload.accountId && requestedAccountId && tokenPayload.accountId !== requestedAccountId) {
+            response.status(403).json({ code: "XERO_AUTH_TOKEN_ACCOUNT_MISMATCH", message: "Xero login token does not match this account." });
+            return;
+        }
+
+        const user = await getOrCreateUserFromEmail({
+            email: tokenPayload.email,
+            displayName: tokenPayload.displayName,
+            loginEvent: true
+        });
+
+        if (!user) {
+            response.status(401).json({ code: "AUTH_REQUIRED", message: "Authentication required." });
+            return;
+        }
+
+        if (user.isSuspended) {
+            sendSuspendedResponse(response);
+            return;
+        }
+
+        request.authenticatedUser = user;
+        next();
+        return;
+    }
+
+    await requireActiveUser(request, response, next);
+}
+
 function extractAuthenticatedEmail(request) {
     const directEmail = normalizeEmail(
         request.headers["x-user-email"] ||
@@ -228,35 +367,17 @@ async function getOrCreateAuthenticatedUser(request) {
     const email = extractAuthenticatedEmail(request);
     if (!email) return null;
 
-    await ensureCoreModelTables();
-
     const displayName = normalizeOptionalString(
         request.headers["x-user-display-name"] ||
         request.body?.displayName ||
         request.body?.submittedByName
     ) || email;
 
-    const result = await pool.query(
-        `
-        INSERT INTO users (email, display_name, role, is_super_admin, last_seen_at, last_login_at, updated_at)
-        VALUES ($1, $2, 'user', $4, now(), COALESCE($3::timestamptz, now()), now())
-        ON CONFLICT (email)
-        DO UPDATE SET
-            display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
-            is_super_admin = users.is_super_admin OR EXCLUDED.is_super_admin,
-            last_seen_at = now(),
-            updated_at = now()
-        RETURNING *
-        `,
-        [
-            email,
-            displayName,
-            request.headers["x-login-event"] ? new Date().toISOString() : null,
-            SERVER_SUPER_ADMIN_EMAILS.has(email)
-        ]
-    );
-
-    return mapUserRow(result.rows[0]);
+    return getOrCreateUserFromEmail({
+        email,
+        displayName,
+        loginEvent: Boolean(request.headers["x-login-event"])
+    });
 }
 
 async function requireAuthenticatedUser(request, response, next) {
@@ -421,7 +542,42 @@ app.use([
     "/jentry/problem-report"
 ], requireActiveUser);
 
-app.get("/oauth/xero/start", requireActiveUser, async (request, response) => {
+app.post("/oauth/xero/start-token", requireActiveUser, async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.body?.accountId || request.query?.accountId);
+        if (!accountId) {
+            response.status(400).json({ message: "Missing accountId." });
+            return;
+        }
+
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: true })) {
+            return;
+        }
+
+        const returnUri = normalizeOptionalString(request.body?.returnUri || request.query?.returnUri) || xeroAppRedirectURI();
+        const xeroAuthToken = createXeroOAuthStartToken({
+            email: request.authenticatedUser.email,
+            displayName: request.authenticatedUser.displayName || request.authenticatedUser.email,
+            accountId
+        });
+
+        const startURL = new URL(`${request.protocol}://${request.get("host")}/oauth/xero/start`);
+        startURL.searchParams.set("accountId", accountId);
+        startURL.searchParams.set("returnUri", returnUri);
+        startURL.searchParams.set("xeroAuthToken", xeroAuthToken);
+
+        response.json({
+            ok: true,
+            xeroAuthToken,
+            startURL: startURL.toString(),
+            expiresInSeconds: Math.floor(XERO_OAUTH_START_TOKEN_TTL_MS / 1000)
+        });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to create Xero login token." });
+    }
+});
+
+app.get("/oauth/xero/start", requireActiveUserOrXeroStartToken, async (request, response) => {
     try {
         if (!xeroConfigured()) {
             response.status(500).json({ message: "Xero OAuth is not configured on the backend." });
@@ -1607,6 +1763,7 @@ app.listen(port, () => {
     console.log(JSON.stringify({
         routes: [
             "GET /health",
+            "POST /oauth/xero/start-token",
             "GET /oauth/xero/start",
             "GET /oauth/xero/callback",
             "GET /xero/status",
