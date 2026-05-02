@@ -30,6 +30,13 @@ const optionalEnvironmentVariables = {
     openAIModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini"
 };
 
+const SERVER_SUPER_ADMIN_EMAILS = new Set(
+    (process.env.SERVER_SUPER_ADMIN_EMAILS || "")
+        .split(",")
+        .map((email) => email.trim().toLowerCase())
+        .filter(Boolean)
+);
+
 for (const key of requiredEnvironmentVariables) {
     if (!process.env[key] || !process.env[key].trim()) {
         throw new Error(`Missing required environment variable: ${key}`);
@@ -232,10 +239,11 @@ async function getOrCreateAuthenticatedUser(request) {
     const result = await pool.query(
         `
         INSERT INTO users (email, display_name, role, is_super_admin, last_seen_at, last_login_at, updated_at)
-        VALUES ($1, $2, 'user', false, now(), COALESCE($3::timestamptz, now()), now())
+        VALUES ($1, $2, 'user', $4, now(), COALESCE($3::timestamptz, now()), now())
         ON CONFLICT (email)
         DO UPDATE SET
             display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
+            is_super_admin = users.is_super_admin OR EXCLUDED.is_super_admin,
             last_seen_at = now(),
             updated_at = now()
         RETURNING *
@@ -243,7 +251,8 @@ async function getOrCreateAuthenticatedUser(request) {
         [
             email,
             displayName,
-            request.headers["x-login-event"] ? new Date().toISOString() : null
+            request.headers["x-login-event"] ? new Date().toISOString() : null,
+            SERVER_SUPER_ADMIN_EMAILS.has(email)
         ]
     );
 
@@ -1933,12 +1942,18 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
         const user = await pool.query(
             `
             INSERT INTO users (email, display_name, role, is_super_admin, updated_at)
-            VALUES ($1, $2, 'user', false, now())
+            VALUES ($1, $2, 'user', $3, now())
             ON CONFLICT (email)
-            DO UPDATE SET display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name), updated_at = now()
+            DO UPDATE SET display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
+                is_super_admin = users.is_super_admin OR EXCLUDED.is_super_admin,
+                updated_at = now()
             RETURNING id
             `,
-            [normalizedAssignedUserEmail, normalizedAssignedUserEmail]
+            [
+                normalizedAssignedUserEmail,
+                normalizedAssignedUserEmail,
+                SERVER_SUPER_ADMIN_EMAILS.has(normalizedAssignedUserEmail)
+            ]
         );
         assignedUserId = user.rows[0]?.id || assignedUserId;
     }
