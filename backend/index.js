@@ -183,10 +183,164 @@ const pool = new Pool({
     ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
+
+const SERVER_SUPER_ADMIN_EMAILS = new Set([
+    "jay@jaccountancy.co.uk",
+    "amie@jaccountancy.co.uk",
+    ...String(process.env.JENTRY_SUPER_ADMIN_EMAILS || "")
+        .split(",")
+        .map((email) => normalizeEmail(email))
+        .filter(Boolean)
+]);
+
+const SUSPENDED_ACCOUNT_ERROR = {
+    code: "ACCOUNT_SUSPENDED",
+    message: "Suspended. Please contact Jaccountancy."
+};
+
+function sendSuspendedResponse(response) {
+    response.status(403).json(SUSPENDED_ACCOUNT_ERROR);
+}
+
+function extractAuthenticatedEmail(request) {
+    const directEmail = normalizeEmail(
+        request.headers["x-user-email"] ||
+        request.headers["x-authenticated-user-email"] ||
+        request.headers["x-jentry-user-email"] ||
+        request.body?.userEmail ||
+        request.body?.submittedByEmail ||
+        request.query?.userEmail ||
+        request.query?.connectedUserEmail
+    );
+
+    if (directEmail) return directEmail;
+
+    const authorization = normalizeOptionalString(request.headers.authorization);
+    const token = authorization.toLowerCase().startsWith("bearer ")
+        ? authorization.slice(7).trim()
+        : "";
+    const claims = parseJWTPayload(token);
+    return normalizeEmail(claims?.email || claims?.preferred_username || claims?.upn);
+}
+
+async function getOrCreateAuthenticatedUser(request) {
+    const email = extractAuthenticatedEmail(request);
+    if (!email) return null;
+
+    await ensureCoreModelTables();
+    await ensureServerSuperAdmins();
+
+    const displayName = normalizeOptionalString(
+        request.headers["x-user-display-name"] ||
+        request.body?.displayName ||
+        request.body?.submittedByName
+    ) || email;
+
+    const result = await pool.query(
+        `
+        INSERT INTO users (email, display_name, role, is_super_admin, last_seen_at, last_login_at, updated_at)
+        VALUES ($1, $2, $3, $4, now(), COALESCE($5::timestamptz, now()), now())
+        ON CONFLICT (email)
+        DO UPDATE SET
+            display_name = COALESCE(NULLIF(EXCLUDED.display_name, ''), users.display_name),
+            is_super_admin = CASE WHEN LOWER(users.email) = ANY($6::text[]) THEN true ELSE users.is_super_admin END,
+            last_seen_at = now(),
+            updated_at = now()
+        RETURNING *
+        `,
+        [
+            email,
+            displayName,
+            SERVER_SUPER_ADMIN_EMAILS.has(email) ? "super_admin" : "user",
+            SERVER_SUPER_ADMIN_EMAILS.has(email),
+            request.headers["x-login-event"] ? new Date().toISOString() : null,
+            [...SERVER_SUPER_ADMIN_EMAILS]
+        ]
+    );
+
+    return mapUserRow(result.rows[0]);
+}
+
+async function requireAuthenticatedUser(request, response, next) {
+    try {
+        const user = await getOrCreateAuthenticatedUser(request);
+        if (!user) {
+            response.status(401).json({ code: "AUTH_REQUIRED", message: "Authentication required." });
+            return;
+        }
+        request.authenticatedUser = user;
+        next();
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to authenticate user." });
+    }
+}
+
+async function requireActiveUser(request, response, next) {
+    await requireAuthenticatedUser(request, response, async () => {
+        if (request.authenticatedUser?.isSuspended) {
+            sendSuspendedResponse(response);
+            return;
+        }
+        next();
+    });
+}
+
+async function requireAdminUser(request, response, next) {
+    await requireAuthenticatedUser(request, response, async () => {
+        const user = request.authenticatedUser;
+        if (user?.isSuspended) {
+            sendSuspendedResponse(response);
+            return;
+        }
+        if (!user?.isSuperAdmin) {
+            response.status(403).json({ code: "ADMIN_FORBIDDEN", message: "Super admin access required." });
+            return;
+        }
+        next();
+    });
+}
+
 app.get("/health", (_request, response) => {
     console.log("Health check received.");
     response.json({ ok: true });
 });
+
+
+app.post("/session/heartbeat", requireActiveUser, async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.body?.accountId);
+        const connectedUserEmail = normalizeEmail(request.body?.connectedUserEmail);
+        await updatePresence({
+            userId: request.authenticatedUser.id,
+            accountId,
+            connectedUserEmail
+        });
+        response.json({ ok: true, lastSeenAt: new Date().toISOString() });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update heartbeat." });
+    }
+});
+
+app.use([
+    "/oauth/xero/start",
+    "/xero/status",
+    "/xero/tenants",
+    "/xero/select-tenant",
+    "/xero/disconnect",
+    "/xero/accounts",
+    "/xero/match-transactions",
+    "/xero/publish-bill",
+    "/xero/attach-document",
+    "/xero/contacts",
+    "/xero/ensure-contact",
+    "/jentry/uploads",
+    "/jentry/inbox/register",
+    "/inbound-email-submissions",
+    "/analyze",
+    "/jentry/analyze",
+    "/problem-report",
+    "/jentry/problem-report"
+], requireActiveUser);
 
 app.get("/oauth/xero/start", async (request, response) => {
     try {
@@ -708,6 +862,20 @@ app.post("/jentry/inbox/register", async (request, response) => {
         }
 
         await ensureJentryAccountsTable();
+        await upsertAccountRecord({
+            accountId,
+            clientId: clientId || null,
+            companyName: companyName || null,
+            assignedUserId: request.authenticatedUser?.id || null
+        });
+        await upsertJentryInboxRecord({
+            accountId,
+            inboxEmail,
+            assignedUserEmail: request.authenticatedUser?.email || null,
+            assignedUserId: request.authenticatedUser?.id || null,
+            updatedBy: request.authenticatedUser?.email || null,
+            isActive: true
+        });
 
         await pool.query(
             `
@@ -957,6 +1125,250 @@ app.post("/xero/ensure-contact", async (req, res) => {
     }
 });
 
+
+
+app.get("/admin/overview", requireAdminUser, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const [users, accounts, xero, inboxes, submissions] = await Promise.all([
+            pool.query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE NOT is_suspended)::int AS active, COUNT(*) FILTER (WHERE is_suspended)::int AS suspended FROM users`),
+            pool.query(`SELECT COUNT(*)::int AS total FROM accounts`),
+            pool.query(`SELECT COUNT(*)::int AS connected FROM xero_connections WHERE is_connected = true`),
+            pool.query(`SELECT COUNT(*)::int AS total FROM jentry_inboxes`),
+            pool.query(`SELECT COUNT(*)::int AS recent FROM processed_inbound_submissions WHERE created_at >= now() - interval '30 days'`).catch(() => ({ rows: [{ recent: 0 }] }))
+        ]);
+        response.json({
+            totals: {
+                users: users.rows[0].total,
+                activeUsers: users.rows[0].active,
+                suspendedUsers: users.rows[0].suspended,
+                accounts: accounts.rows[0].total,
+                connectedXeroAccounts: xero.rows[0].connected,
+                inboxes: inboxes.rows[0].total,
+                recentSubmissions: submissions.rows[0].recent
+            }
+        });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load admin overview." });
+    }
+});
+
+app.get("/admin/users", requireAdminUser, async (_request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const result = await pool.query(`
+            SELECT
+                u.id,
+                u.email,
+                u.display_name,
+                u.role,
+                u.is_super_admin,
+                u.is_suspended,
+                u.suspension_reason,
+                u.last_seen_at,
+                u.last_login_at,
+                COALESCE(jsonb_agg(DISTINCT jsonb_build_object('accountId', a.id, 'companyName', a.company_name, 'clientId', a.client_id)) FILTER (WHERE a.id IS NOT NULL), '[]'::jsonb) AS assigned_accounts,
+                COALESCE(jsonb_agg(DISTINCT jsonb_build_object('inboxId', ji.id, 'inboxEmail', ji.inbox_email, 'isActive', ji.is_active)) FILTER (WHERE ji.id IS NOT NULL), '[]'::jsonb) AS jentry_inboxes,
+                MAX(xc.connected_user_email) AS connected_xero_email,
+                MAX(a.last_submission_at) AS last_submission_at
+            FROM users u
+            LEFT JOIN memberships m ON m.user_id = u.id
+            LEFT JOIN accounts a ON a.id = m.account_id OR a.assigned_user_id = u.id
+            LEFT JOIN jentry_inboxes ji ON ji.assigned_user_id = u.id OR LOWER(ji.assigned_user_email) = LOWER(u.email)
+            LEFT JOIN xero_connections xc ON xc.account_id = a.id
+            GROUP BY u.id
+            ORDER BY u.created_at DESC
+        `);
+        response.json({ users: result.rows.map(mapAdminUserRow) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load admin users." });
+    }
+});
+
+app.patch("/admin/users/:userId/suspension", requireAdminUser, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const userId = normalizeOptionalString(request.params.userId);
+        const isSuspended = Boolean(request.body?.isSuspended);
+        const reason = normalizeOptionalString(request.body?.reason) || (isSuspended ? "Manual suspension by Jaccountancy" : null);
+        const result = await pool.query(
+            `UPDATE users SET is_suspended = $2, suspension_reason = $3, updated_at = now() WHERE id = $1 RETURNING *`,
+            [userId, isSuspended, reason]
+        );
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "User not found." });
+            return;
+        }
+        await writeAdminAuditLog(request, {
+            action: isSuspended ? "user.suspended" : "user.reenabled",
+            targetType: "user",
+            targetId: userId,
+            details: { reason }
+        });
+        response.json({ user: mapUserRow(result.rows[0]) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update suspension." });
+    }
+});
+
+app.get("/admin/accounts", requireAdminUser, async (_request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const result = await pool.query(`
+            SELECT
+                a.id AS account_id,
+                a.company_name,
+                a.client_id,
+                a.status,
+                a.last_submission_at,
+                u.email AS assigned_user_email,
+                u.display_name AS assigned_user_display_name,
+                u.last_seen_at,
+                u.is_suspended,
+                ji.inbox_email AS jentry_inbox_email,
+                xc.connected_user_email AS connected_xero_email,
+                xc.is_connected,
+                xc.requires_reconnect,
+                xc.tenant_id,
+                xc.tenant_name,
+                COUNT(p.id)::int AS submission_count
+            FROM accounts a
+            LEFT JOIN users u ON u.id = a.assigned_user_id
+            LEFT JOIN jentry_inboxes ji ON ji.account_id = a.id AND ji.is_active = true
+            LEFT JOIN xero_connections xc ON xc.account_id = a.id
+            LEFT JOIN processed_inbound_submissions p ON p.account_id = a.id
+            GROUP BY a.id, u.id, ji.id, xc.id
+            ORDER BY a.created_at DESC
+        `);
+        response.json({ accounts: result.rows.map(mapAdminAccountRow) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load admin accounts." });
+    }
+});
+
+app.patch("/admin/accounts/:accountId", requireAdminUser, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const accountId = normalizeOptionalString(request.params.accountId);
+        const assignedUserId = normalizeOptionalString(request.body?.assignedUserId || request.body?.assigned_user_id) || null;
+        const companyName = normalizeOptionalString(request.body?.companyName || request.body?.displayName || request.body?.company_name) || null;
+        const clientEmail = normalizeEmail(request.body?.clientEmail || request.body?.client_email) || null;
+        const status = normalizeOptionalString(request.body?.status) || null;
+        const result = await pool.query(
+            `
+            UPDATE accounts
+            SET assigned_user_id = COALESCE($2, assigned_user_id),
+                company_name = COALESCE($3, company_name),
+                client_email = COALESCE($4, client_email),
+                status = COALESCE($5, status),
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            `,
+            [accountId, assignedUserId, companyName, clientEmail, status]
+        );
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Account not found." });
+            return;
+        }
+        await writeAdminAuditLog(request, {
+            action: "account.updated",
+            targetType: "account",
+            targetId: accountId,
+            details: { assignedUserId, companyName, clientEmail, status }
+        });
+        response.json({ account: mapAccountRow(result.rows[0]) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update account." });
+    }
+});
+
+app.get("/admin/inboxes", requireAdminUser, async (_request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const result = await pool.query(`
+            SELECT ji.*, a.company_name, u.email AS user_email
+            FROM jentry_inboxes ji
+            LEFT JOIN accounts a ON a.id = ji.account_id
+            LEFT JOIN users u ON u.id = ji.assigned_user_id
+            ORDER BY ji.updated_at DESC
+        `);
+        response.json({ inboxes: result.rows.map(mapInboxRow) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load inboxes." });
+    }
+});
+
+app.patch("/admin/inboxes/:inboxId", requireAdminUser, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const inboxId = normalizeOptionalString(request.params.inboxId);
+        const inboxEmail = normalizeEmail(request.body?.inboxEmail || request.body?.inbox_email) || null;
+        const assignedUserId = normalizeOptionalString(request.body?.assignedUserId || request.body?.assigned_user_id) || null;
+        const assignedUserEmail = normalizeEmail(request.body?.assignedUserEmail || request.body?.assigned_user_email) || null;
+        const isActive = typeof request.body?.isActive === "boolean" ? request.body.isActive : null;
+        const result = await pool.query(
+            `
+            UPDATE jentry_inboxes
+            SET inbox_email = COALESCE($2, inbox_email),
+                assigned_user_id = COALESCE($3, assigned_user_id),
+                assigned_user_email = COALESCE($4, assigned_user_email),
+                is_active = COALESCE($5, is_active),
+                updated_by = $6,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            `,
+            [inboxId, inboxEmail, assignedUserId, assignedUserEmail, isActive, request.authenticatedUser.email]
+        );
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Inbox not found." });
+            return;
+        }
+        await writeAdminAuditLog(request, {
+            action: "inbox.updated",
+            targetType: "jentry_inbox",
+            targetId: inboxId,
+            details: { inboxEmail, assignedUserId, assignedUserEmail, isActive }
+        });
+        response.json({ inbox: mapInboxRow(result.rows[0]) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update inbox." });
+    }
+});
+
+app.get("/admin/xero-connections", requireAdminUser, async (_request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const result = await pool.query(`
+            SELECT xc.*, a.company_name, a.client_id
+            FROM xero_connections xc
+            LEFT JOIN accounts a ON a.id = xc.account_id
+            ORDER BY xc.updated_at DESC
+        `);
+        response.json({ connections: result.rows.map(mapXeroConnectionRow) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load Xero connections." });
+    }
+});
+
+app.get("/admin/activity", requireAdminUser, async (_request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const result = await pool.query(`
+            SELECT l.*, u.email AS actor_user_email, a.company_name
+            FROM admin_audit_log l
+            LEFT JOIN users u ON u.id = l.actor_user_id
+            LEFT JOIN accounts a ON a.id = l.target_id AND l.target_type = 'account'
+            ORDER BY l.created_at DESC
+            LIMIT 250
+        `);
+        response.json({ activity: result.rows.map(mapAuditRow) });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load activity." });
+    }
+});
+
 app.use((request, response) => {
     response.status(404).send(`Cannot ${request.method} ${request.path}`);
 });
@@ -985,7 +1397,17 @@ app.listen(port, () => {
             "POST /jentry/problem-report",
             "POST /inbound/postmark",
             "GET /xero/contacts",
-            "POST /xero/ensure-contact"
+            "POST /xero/ensure-contact",
+            "POST /session/heartbeat",
+            "GET /admin/overview",
+            "GET /admin/users",
+            "PATCH /admin/users/:userId/suspension",
+            "GET /admin/accounts",
+            "PATCH /admin/accounts/:accountId",
+            "GET /admin/inboxes",
+            "PATCH /admin/inboxes/:inboxId",
+            "GET /admin/xero-connections",
+            "GET /admin/activity"
         ]
     }));
 });
@@ -1085,7 +1507,337 @@ async function problemReportHandler(request, response) {
     }
 }
 
+
+async function ensureCoreModelTables() {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`).catch(() => undefined);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+            id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            email text UNIQUE NOT NULL,
+            display_name text,
+            role text NOT NULL DEFAULT 'user',
+            is_super_admin boolean NOT NULL DEFAULT false,
+            is_suspended boolean NOT NULL DEFAULT false,
+            suspension_reason text,
+            last_seen_at timestamptz,
+            last_login_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS accounts (
+            id text PRIMARY KEY,
+            company_name text,
+            client_id text,
+            client_email text,
+            nature_of_business text,
+            is_vat_registered boolean NOT NULL DEFAULT false,
+            status text NOT NULL DEFAULT 'active',
+            assigned_user_id text REFERENCES users(id) ON DELETE SET NULL,
+            last_submission_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS memberships (
+            id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            role text NOT NULL DEFAULT 'member',
+            created_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE(user_id, account_id)
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS xero_connections (
+            account_id text PRIMARY KEY,
+            payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS id text DEFAULT gen_random_uuid()::text`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS connected_user_email text`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS tenant_id text`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS tenant_name text`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS is_connected boolean NOT NULL DEFAULT false`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS requires_reconnect boolean NOT NULL DEFAULT false`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS last_connected_at timestamptz`);
+    await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz`);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS jentry_inboxes (
+            id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            account_id text NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+            inbox_email text UNIQUE NOT NULL,
+            assigned_user_email text,
+            assigned_user_id text REFERENCES users(id) ON DELETE SET NULL,
+            is_active boolean NOT NULL DEFAULT true,
+            updated_by text,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+            actor_user_id text REFERENCES users(id) ON DELETE SET NULL,
+            actor_email text,
+            action text NOT NULL,
+            target_type text,
+            target_id text,
+            details_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+            created_at timestamptz NOT NULL DEFAULT now()
+        )
+    `);
+
+    await ensureServerSuperAdmins();
+}
+
+async function ensureServerSuperAdmins() {
+    if (!SERVER_SUPER_ADMIN_EMAILS.size) return;
+    for (const email of SERVER_SUPER_ADMIN_EMAILS) {
+        await pool.query(
+            `
+            INSERT INTO users (email, display_name, role, is_super_admin, created_at, updated_at)
+            VALUES ($1, $2, 'super_admin', true, now(), now())
+            ON CONFLICT (email)
+            DO UPDATE SET is_super_admin = true, role = 'super_admin', updated_at = now()
+            `,
+            [email, email]
+        );
+    }
+}
+
+async function upsertAccountRecord({ accountId, clientId = null, companyName = null, natureOfBusiness = null, isVatRegistered = null, status = null, assignedUserId = null, clientEmail = null } = {}) {
+    const id = normalizeOptionalString(accountId);
+    if (!id) return null;
+    await ensureCoreModelTables();
+    const result = await pool.query(
+        `
+        INSERT INTO accounts (id, client_id, company_name, nature_of_business, is_vat_registered, status, assigned_user_id, client_email, updated_at)
+        VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6, 'active'), $7, $8, now())
+        ON CONFLICT (id)
+        DO UPDATE SET
+            client_id = COALESCE(EXCLUDED.client_id, accounts.client_id),
+            company_name = COALESCE(EXCLUDED.company_name, accounts.company_name),
+            nature_of_business = COALESCE(EXCLUDED.nature_of_business, accounts.nature_of_business),
+            is_vat_registered = COALESCE(EXCLUDED.is_vat_registered, accounts.is_vat_registered),
+            status = COALESCE(EXCLUDED.status, accounts.status),
+            assigned_user_id = COALESCE(EXCLUDED.assigned_user_id, accounts.assigned_user_id),
+            client_email = COALESCE(EXCLUDED.client_email, accounts.client_email),
+            updated_at = now()
+        RETURNING *
+        `,
+        [id, clientId, companyName, natureOfBusiness, isVatRegistered, status, assignedUserId, clientEmail]
+    );
+    return mapAccountRow(result.rows[0]);
+}
+
+async function upsertJentryInboxRecord({ accountId, inboxEmail, assignedUserEmail = null, assignedUserId = null, updatedBy = null, isActive = true } = {}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    const normalizedInboxEmail = normalizeEmail(inboxEmail);
+    if (!normalizedAccountId || !normalizedInboxEmail) return null;
+    await upsertAccountRecord({ accountId: normalizedAccountId });
+    const result = await pool.query(
+        `
+        INSERT INTO jentry_inboxes (account_id, inbox_email, assigned_user_email, assigned_user_id, is_active, updated_by, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, now())
+        ON CONFLICT (inbox_email)
+        DO UPDATE SET
+            account_id = EXCLUDED.account_id,
+            assigned_user_email = COALESCE(EXCLUDED.assigned_user_email, jentry_inboxes.assigned_user_email),
+            assigned_user_id = COALESCE(EXCLUDED.assigned_user_id, jentry_inboxes.assigned_user_id),
+            is_active = EXCLUDED.is_active,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = now()
+        RETURNING *
+        `,
+        [normalizedAccountId, normalizedInboxEmail, assignedUserEmail, assignedUserId, Boolean(isActive), updatedBy]
+    );
+    return mapInboxRow(result.rows[0]);
+}
+
+async function updatePresence({ userId, accountId = null, connectedUserEmail = null } = {}) {
+    await ensureCoreModelTables();
+    if (userId) {
+        await pool.query(`UPDATE users SET last_seen_at = now(), updated_at = now() WHERE id = $1`, [userId]);
+    }
+    if (accountId) {
+        await upsertAccountRecord({ accountId });
+        if (userId) {
+            await pool.query(
+                `INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, 'member') ON CONFLICT (user_id, account_id) DO NOTHING`,
+                [userId, accountId]
+            );
+        }
+        if (connectedUserEmail) {
+            await pool.query(`UPDATE xero_connections SET connected_user_email = COALESCE($2, connected_user_email), last_synced_at = now() WHERE account_id = $1`, [accountId, connectedUserEmail]);
+        }
+    }
+}
+
+async function markSubmissionAccepted({ accountId, userId = null } = {}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    if (!normalizedAccountId) return;
+    await upsertAccountRecord({ accountId: normalizedAccountId });
+    await pool.query(`UPDATE accounts SET last_submission_at = now(), updated_at = now() WHERE id = $1`, [normalizedAccountId]);
+    if (userId) {
+        await pool.query(`UPDATE users SET last_seen_at = now(), updated_at = now() WHERE id = $1`, [userId]);
+    }
+}
+
+async function writeAdminAuditLog(request, { action, targetType, targetId, details = {} } = {}) {
+    await ensureCoreModelTables();
+    await pool.query(
+        `
+        INSERT INTO admin_audit_log (actor_user_id, actor_email, action, target_type, target_id, details_json)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+        `,
+        [
+            request.authenticatedUser?.id || null,
+            request.authenticatedUser?.email || null,
+            action,
+            targetType || null,
+            targetId || null,
+            JSON.stringify(details || {})
+        ]
+    );
+}
+
+function mapUserRow(row) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        email: row.email,
+        displayName: row.display_name || null,
+        role: row.role || "user",
+        isSuperAdmin: Boolean(row.is_super_admin),
+        isSuspended: Boolean(row.is_suspended),
+        suspensionReason: row.suspension_reason || null,
+        lastSeenAt: row.last_seen_at || null,
+        lastLoginAt: row.last_login_at || null,
+        createdAt: row.created_at || null,
+        updatedAt: row.updated_at || null
+    };
+}
+
+function mapAccountRow(row) {
+    if (!row) return null;
+    return {
+        accountId: row.id || row.account_id,
+        companyName: row.company_name || null,
+        clientId: row.client_id || null,
+        clientEmail: row.client_email || null,
+        natureOfBusiness: row.nature_of_business || null,
+        isVatRegistered: Boolean(row.is_vat_registered),
+        status: row.status || null,
+        assignedUserId: row.assigned_user_id || null,
+        lastSubmissionAt: row.last_submission_at || null,
+        createdAt: row.created_at || null,
+        updatedAt: row.updated_at || null
+    };
+}
+
+function mapAdminUserRow(row) {
+    return {
+        userId: row.id,
+        email: row.email,
+        displayName: row.display_name || null,
+        role: row.role || "user",
+        isSuperAdmin: Boolean(row.is_super_admin),
+        isSuspended: Boolean(row.is_suspended),
+        suspensionReason: row.suspension_reason || null,
+        lastOnline: row.last_seen_at || null,
+        lastLogin: row.last_login_at || null,
+        assignedAccounts: row.assigned_accounts || [],
+        connectedXeroEmail: row.connected_xero_email || null,
+        jentryInboxes: row.jentry_inboxes || [],
+        lastSubmission: row.last_submission_at || null
+    };
+}
+
+function mapAdminAccountRow(row) {
+    return {
+        accountId: row.account_id,
+        companyName: row.company_name || null,
+        clientId: row.client_id || null,
+        assignedUserEmail: row.assigned_user_email || null,
+        assignedUserDisplayName: row.assigned_user_display_name || null,
+        jentryInboxEmail: row.jentry_inbox_email || null,
+        xeroConnectionStatus: row.is_connected ? "connected" : "disconnected",
+        connectedXeroEmail: row.connected_xero_email || null,
+        isSuspended: Boolean(row.is_suspended),
+        lastSeenAt: row.last_seen_at || null,
+        lastSubmissionAt: row.last_submission_at || null,
+        submissionCounts: Number(row.submission_count || 0),
+        isConnectedToXero: Boolean(row.is_connected),
+        requiresReconnect: Boolean(row.requires_reconnect),
+        tenantId: row.tenant_id || null,
+        tenantName: row.tenant_name || null,
+        status: row.status || null
+    };
+}
+
+function mapInboxRow(row) {
+    return {
+        inboxId: row.id,
+        accountId: row.account_id,
+        inboxEmail: row.inbox_email,
+        companyName: row.company_name || null,
+        assignedUserEmail: row.assigned_user_email || row.user_email || null,
+        assignedUserId: row.assigned_user_id || null,
+        isActive: Boolean(row.is_active),
+        updatedBy: row.updated_by || null,
+        updatedAt: row.updated_at || null
+    };
+}
+
+function mapXeroConnectionRow(row) {
+    return {
+        id: row.id || null,
+        accountId: row.account_id,
+        account: {
+            accountId: row.account_id,
+            companyName: row.company_name || null,
+            clientId: row.client_id || null
+        },
+        tenantId: row.tenant_id || row.payload?.selectedTenantId || null,
+        tenantName: row.tenant_name || row.payload?.selectedTenantName || null,
+        connectedUserEmail: row.connected_user_email || row.payload?.connectedUserEmail || null,
+        isConnected: Boolean(row.is_connected),
+        requiresReconnect: Boolean(row.requires_reconnect),
+        lastConnectedAt: row.last_connected_at || row.payload?.connectedAt || null,
+        lastSync: row.last_synced_at || row.payload?.lastRefreshedAt || null,
+        updatedAt: row.updated_at || null
+    };
+}
+
+function mapAuditRow(row) {
+    return {
+        id: row.id,
+        user: row.actor_email || row.actor_user_email || null,
+        actorUserId: row.actor_user_id || null,
+        account: row.company_name || null,
+        action: row.action,
+        targetType: row.target_type || null,
+        targetId: row.target_id || null,
+        submissionId: row.details_json?.submissionId || null,
+        device: row.details_json?.device || null,
+        details: row.details_json || {},
+        createdAt: row.created_at
+    };
+}
+
 async function ensureJentryAccountsTable() {
+    await ensureCoreModelTables();
     await pool.query(`
         CREATE TABLE IF NOT EXISTS jentry_accounts (
             account_id text PRIMARY KEY,
@@ -1102,6 +1854,15 @@ async function resolveAccountIdFromInboundAddress(email) {
     if (!normalizedEmail) return null;
 
     await ensureJentryAccountsTable();
+
+    const inboxResult = await pool.query(
+        `SELECT account_id FROM jentry_inboxes WHERE LOWER(inbox_email) = LOWER($1) AND is_active = true LIMIT 1`,
+        [normalizedEmail]
+    );
+
+    if (inboxResult.rows[0]?.account_id) {
+        return inboxResult.rows[0].account_id;
+    }
 
     const result = await pool.query(
         `SELECT account_id FROM jentry_accounts WHERE LOWER(jentry_inbox_email) = LOWER($1) LIMIT 1`,
@@ -1241,6 +2002,8 @@ async function createProcessedInboundSubmission({
         normalizeOptionalString(primary.shortDescription) ||
         normalizeOptionalString(primary.summary) ||
         "Processed from inbound email.";
+
+    await markSubmissionAccepted({ accountId });
 
     await pool.query(
         `
@@ -1544,13 +2307,7 @@ function buildReturnURL(baseURL, params) {
 }
 
 async function ensureXeroConnectionsTable() {
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS xero_connections (
-            account_id text PRIMARY KEY,
-            payload jsonb NOT NULL,
-            updated_at timestamptz NOT NULL DEFAULT now()
-        )
-    `);
+    await ensureCoreModelTables();
 }
 
 async function getXeroConnection(accountId) {
@@ -1578,14 +2335,35 @@ async function upsertXeroConnection(accountId, updater) {
 
     await ensureXeroConnectionsTable();
 
+    await upsertAccountRecord({ accountId: normalizedAccountId });
+
     await pool.query(
         `
-        INSERT INTO xero_connections (account_id, payload, updated_at)
-        VALUES ($1, $2::jsonb, now())
+        INSERT INTO xero_connections (
+            account_id, payload, connected_user_email, tenant_id, tenant_name,
+            is_connected, requires_reconnect, last_connected_at, last_synced_at, updated_at
+        )
+        VALUES ($1, $2::jsonb, $3, $4, $5, true, false, COALESCE($6::timestamptz, now()), now(), now())
         ON CONFLICT (account_id)
-        DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()
+        DO UPDATE SET
+            payload = EXCLUDED.payload,
+            connected_user_email = EXCLUDED.connected_user_email,
+            tenant_id = EXCLUDED.tenant_id,
+            tenant_name = EXCLUDED.tenant_name,
+            is_connected = true,
+            requires_reconnect = false,
+            last_connected_at = COALESCE(xero_connections.last_connected_at, EXCLUDED.last_connected_at),
+            last_synced_at = now(),
+            updated_at = now()
         `,
-        [normalizedAccountId, JSON.stringify(next)]
+        [
+            normalizedAccountId,
+            JSON.stringify(next),
+            next.connectedUserEmail || null,
+            next.selectedTenantId || null,
+            next.selectedTenantName || null,
+            next.connectedAt || null
+        ]
     );
 
     return next;
@@ -1598,7 +2376,7 @@ async function deleteXeroConnection(accountId) {
     await ensureXeroConnectionsTable();
 
     await pool.query(
-        `DELETE FROM xero_connections WHERE account_id = $1`,
+        `UPDATE xero_connections SET is_connected = false, requires_reconnect = true, updated_at = now() WHERE account_id = $1`,
         [normalizedAccountId]
     );
 }
@@ -2641,6 +3419,8 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         });
     }
 
+    await markSubmissionAccepted({ accountId: normalizedAccountId });
+
     return result;
 }
 
@@ -2676,6 +3456,8 @@ async function handleEmailUpload(metadata, documentFiles) {
             raw: rawMessage
         }
     });
+
+    await markSubmissionAccepted({ accountId: metadata.accountId || metadata.accountID });
 
     return {
         submissionId: metadata.submissionId || sendResult.data.id,
