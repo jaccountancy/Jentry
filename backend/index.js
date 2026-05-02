@@ -301,18 +301,15 @@ async function requireAdminUser(request, response, next) {
 }
 
 function requireSuperAdmin(request, response, next) {
-    const email = normalizeEmail(request.header("X-Jentry-Super-Admin-Email"));
-    const allowed = new Set([
-        "jay@jaccountancy.co.uk",
-        "amie@jaccountancy.co.uk"
-    ]);
+    const headerEmail = normalizeEmail(request.header("X-Jentry-Super-Admin-Email"));
+    const authenticatedEmail = normalizeEmail(request.authenticatedUser?.email);
 
-    if (!allowed.has(email)) {
+    if (!headerEmail || headerEmail !== authenticatedEmail || !SERVER_SUPER_ADMIN_EMAILS.has(authenticatedEmail)) {
         response.status(403).json({ message: "Forbidden" });
         return;
     }
 
-    request.superAdminEmail = email;
+    request.superAdminEmail = authenticatedEmail;
     next();
 }
 
@@ -1143,7 +1140,9 @@ app.post("/xero/ensure-contact", async (req, res) => {
 
 
 
-app.get("/admin/overview", requireSuperAdmin, async (_request, response) => {
+app.use("/admin", requireAuthenticatedUser, requireSuperAdmin);
+
+app.get("/admin/overview", async (_request, response) => {
     try {
         response.json(await buildAdminOverview());
     } catch (error) {
@@ -1151,7 +1150,7 @@ app.get("/admin/overview", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.get("/admin/workspaces", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/workspaces", async (_request, response) => {
     try {
         response.json(await listAdminWorkspaces());
     } catch (error) {
@@ -1159,7 +1158,7 @@ app.get("/admin/workspaces", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.get("/admin/audit-trail", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/audit-trail", async (_request, response) => {
     try {
         response.json(await listAdminAuditTrail());
     } catch (error) {
@@ -1167,7 +1166,7 @@ app.get("/admin/audit-trail", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.patch("/admin/workspaces/:accountId/suspension", requireSuperAdmin, async (request, response) => {
+app.patch("/admin/workspaces/:accountId/suspension", async (request, response) => {
     try {
         const { accountId } = request.params;
         const { isSuspended, reason, actorEmail } = request.body;
@@ -1185,7 +1184,7 @@ app.patch("/admin/workspaces/:accountId/suspension", requireSuperAdmin, async (r
     }
 });
 
-app.patch("/admin/workspaces/:accountId/registry", requireSuperAdmin, async (request, response) => {
+app.patch("/admin/workspaces/:accountId/registry", async (request, response) => {
     try {
         const { accountId } = request.params;
         const { displayName, assignedUserEmail, inboxEmail, actorEmail } = request.body;
@@ -1204,7 +1203,7 @@ app.patch("/admin/workspaces/:accountId/registry", requireSuperAdmin, async (req
     }
 });
 
-app.get("/admin/users", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/users", async (_request, response) => {
     try {
         await ensureCoreModelTables();
         const result = await pool.query(`
@@ -1236,7 +1235,7 @@ app.get("/admin/users", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.patch("/admin/users/:userId/suspension", requireSuperAdmin, async (request, response) => {
+app.patch("/admin/users/:userId/suspension", async (request, response) => {
     try {
         await ensureCoreModelTables();
         const userId = normalizeOptionalString(request.params.userId);
@@ -1262,7 +1261,7 @@ app.patch("/admin/users/:userId/suspension", requireSuperAdmin, async (request, 
     }
 });
 
-app.get("/admin/accounts", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/accounts", async (_request, response) => {
     try {
         await ensureCoreModelTables();
         const result = await pool.query(`
@@ -1297,7 +1296,7 @@ app.get("/admin/accounts", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.patch("/admin/accounts/:accountId", requireSuperAdmin, async (request, response) => {
+app.patch("/admin/accounts/:accountId", async (request, response) => {
     try {
         await ensureCoreModelTables();
         const accountId = normalizeOptionalString(request.params.accountId);
@@ -1334,7 +1333,7 @@ app.patch("/admin/accounts/:accountId", requireSuperAdmin, async (request, respo
     }
 });
 
-app.get("/admin/inboxes", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/inboxes", async (_request, response) => {
     try {
         await ensureCoreModelTables();
         const result = await pool.query(`
@@ -1350,7 +1349,7 @@ app.get("/admin/inboxes", requireSuperAdmin, async (_request, response) => {
     }
 });
 
-app.patch("/admin/inboxes/:inboxId", requireSuperAdmin, async (request, response) => {
+app.patch("/admin/inboxes/:inboxId", async (request, response) => {
     try {
         await ensureCoreModelTables();
         const inboxId = normalizeOptionalString(request.params.inboxId);
@@ -1388,7 +1387,7 @@ app.patch("/admin/inboxes/:inboxId", requireSuperAdmin, async (request, response
     }
 });
 
-app.get("/admin/xero-connections", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/xero-connections", async (_request, response) => {
     try {
         await ensureCoreModelTables();
         const result = await pool.query(`
@@ -1403,7 +1402,7 @@ app.get("/admin/xero-connections", requireSuperAdmin, async (_request, response)
     }
 });
 
-app.get("/admin/activity", requireSuperAdmin, async (_request, response) => {
+app.get("/admin/activity", async (_request, response) => {
     try {
         await ensureCoreModelTables();
         const result = await pool.query(`
@@ -1774,8 +1773,11 @@ async function buildAdminOverview() {
         pool.query(`
             SELECT
                 COUNT(*)::int AS total,
-                COUNT(*) FILTER (WHERE status = 'suspended')::int AS suspended
-            FROM accounts
+                COUNT(*) FILTER (
+                    WHERE a.status = 'suspended' OR COALESCE(u.is_suspended, false) = true
+                )::int AS suspended
+            FROM accounts a
+            LEFT JOIN users u ON u.id = a.assigned_user_id
         `),
         pool.query(`
             SELECT
@@ -2011,18 +2013,26 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
     });
 }
 
+function normalizeRequiredAdminString(value) {
+    return normalizeOptionalString(value);
+}
+
 function mapAdminWorkspaceRow(row) {
     const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
     const chartOfAccounts = Array.isArray(payload.chartOfAccounts) ? payload.chartOfAccounts : [];
     const contacts = Array.isArray(payload.contacts) ? payload.contacts : [];
+    const accountID = normalizeRequiredAdminString(row.account_id);
+    const companyName = normalizeRequiredAdminString(row.company_name);
+    const clientID = normalizeRequiredAdminString(row.client_id);
+    const jentryInboxEmail = normalizeRequiredAdminString(row.jentry_inbox_email);
 
     return {
-        accountID: row.account_id,
-        companyName: row.company_name || null,
-        clientID: row.client_id || null,
-        displayName: row.company_name || row.assigned_user_display_name || null,
+        accountID,
+        companyName,
+        clientID,
+        displayName: normalizeRequiredAdminString(row.company_name || row.assigned_user_display_name),
         assignedUserEmail: row.assigned_user_email || row.client_email || null,
-        jentryInboxEmail: row.jentry_inbox_email || null,
+        jentryInboxEmail,
         xeroConnectedUserEmail: row.xero_connected_user_email || payload.connectedUserEmail || null,
         xeroOrganisationID: row.xero_organisation_id || payload.selectedTenantId || null,
         xeroOrganisationName: row.xero_organisation_name || payload.selectedTenantName || null,
