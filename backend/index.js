@@ -44,6 +44,26 @@ for (const key of requiredEnvironmentVariables) {
 }
 
 const app = express();
+app.post("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }), async (request, response) => {
+    try {
+        if (!STRIPE_WEBHOOK_SECRET) {
+            response.status(503).json({ message: "Stripe webhook secret is not configured." });
+            return;
+        }
+
+        const signature = normalizeOptionalString(request.header("stripe-signature"));
+        if (!signature) {
+            response.status(400).json({ message: "Missing Stripe signature." });
+            return;
+        }
+
+        const event = verifyStripeWebhookEvent(request.body, signature, STRIPE_WEBHOOK_SECRET);
+        await handleStripeWebhookEvent(event);
+        response.json({ received: true });
+    } catch (error) {
+        response.status(400).json({ message: error instanceof Error ? error.message : "Invalid Stripe webhook." });
+    }
+});
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
@@ -78,6 +98,18 @@ const XERO_INVOICE_HISTORY_URL = (invoiceId) => `${XERO_INVOICES_URL}/${encodeUR
 const XERO_ACCOUNTS_URL = "https://api.xero.com/api.xro/2.0/Accounts";
 const XERO_BANK_TRANSACTIONS_URL = "https://api.xero.com/api.xro/2.0/BankTransactions";
 const XERO_CONTACTS_URL = "https://api.xero.com/api.xro/2.0/Contacts";
+const STRIPE_API_BASE_URL = "https://api.stripe.com/v1";
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY?.trim() || "";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET?.trim() || "";
+const STRIPE_PRICE_GBP_MONTHLY_ID = process.env.STRIPE_PRICE_GBP_MONTHLY_ID?.trim() || "";
+const JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE = Number(process.env.JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE || 300);
+const JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP = (JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE / 100).toFixed(2);
+const JACCOUNTANCY_FREE_CLIENT_DOMAINS = new Set(
+    (process.env.JACCOUNTANCY_FREE_CLIENT_DOMAINS || "jaccountancy.co.uk")
+        .split(",")
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean)
+);
 
 
 class XeroAPIError extends Error {
@@ -199,8 +231,17 @@ const SUSPENDED_ACCOUNT_ERROR = {
     message: "Suspended. Please contact Jaccountancy."
 };
 
+const PAID_SUBSCRIPTION_REQUIRED_ERROR = {
+    code: "PAID_SUBSCRIPTION_REQUIRED",
+    message: `We understand that you're not a Jaccountancy client. Jentry is free only for Jaccountancy clients. To continue using the software, start the Â£${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP} per month subscription.`
+};
+
 function sendSuspendedResponse(response) {
     response.status(403).json(SUSPENDED_ACCOUNT_ERROR);
+}
+
+function sendPaidSubscriptionRequiredResponse(response) {
+    response.status(402).json(PAID_SUBSCRIPTION_REQUIRED_ERROR);
 }
 
 const XERO_OAUTH_START_TOKEN_TTL_MS = Number(process.env.XERO_OAUTH_START_TOKEN_TTL_MS || 10 * 60 * 1000);
@@ -550,6 +591,8 @@ async function requireAuthorizedAccountAccess(request, response, accountId, { al
             a.id AS account_id,
             a.assigned_user_id,
             a.status,
+            a.billing_mode,
+            a.subscription_status,
             m.user_id AS member_user_id
         FROM accounts a
         LEFT JOIN memberships m
@@ -578,11 +621,28 @@ async function requireAuthorizedAccountAccess(request, response, accountId, { al
             `INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, 'owner') ON CONFLICT (user_id, account_id) DO NOTHING`,
             [user.id, normalizedAccountId]
         );
+        await writeAdminAuditLog(request, {
+            action: "workspace.registered",
+            targetType: "workspace",
+            targetId: normalizedAccountId,
+            details: {
+                category: "registration",
+                actionTitle: "New account registration",
+                targetName: normalizedAccountId,
+                detail: `${user.email} registered a new Jentry account.`,
+                afterSummary: user.email
+            }
+        });
         return true;
     }
 
     if (account.status === "suspended") {
         sendSuspendedResponse(response);
+        return false;
+    }
+
+    if (isBillingBlockedRow(account)) {
+        sendPaidSubscriptionRequiredResponse(response);
         return false;
     }
 
@@ -612,6 +672,164 @@ app.post("/session/heartbeat", requireActiveUser, async (request, response) => {
         response.json({ ok: true, lastSeenAt: new Date().toISOString() });
     } catch (error) {
         response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update heartbeat." });
+    }
+});
+
+app.get("/account/access-status", requireActiveUser, async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.query?.accountId || request.body?.accountId);
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: false })) {
+            return;
+        }
+
+        await ensureCoreModelTables();
+        const result = await pool.query(
+            `
+            SELECT
+                id,
+                company_name,
+                status,
+                billing_mode,
+                subscription_status,
+                subscription_amount_pence,
+                subscription_started_at,
+                subscription_current_period_end,
+                stripe_customer_id,
+                stripe_subscription_id
+            FROM accounts
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [accountId]
+        );
+
+        const row = result.rows[0];
+        if (!row) {
+            response.status(404).json({ message: "Account not found." });
+            return;
+        }
+
+        response.json(mapAccountAccessStatusRow(row));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load account access status." });
+    }
+});
+
+app.patch("/account/xero-files-email", requireActiveUser, async (request, response) => {
+    try {
+        const accountId = normalizeOptionalString(request.body?.accountId || request.query?.accountId);
+        const inboxEmail = normalizeEmail(request.body?.inboxEmail || request.body?.xeroFilesEmail || request.query?.inboxEmail);
+        if (!accountId || !inboxEmail) {
+            response.status(400).json({ message: "Account ID and Xero Files email are required." });
+            return;
+        }
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: false })) {
+            return;
+        }
+
+        await upsertJentryInboxRecord({
+            accountId,
+            inboxEmail,
+            assignedUserEmail: request.authenticatedUser?.email || null,
+            assignedUserId: request.authenticatedUser?.id || null,
+            updatedBy: request.authenticatedUser?.email || null,
+            isActive: true
+        });
+
+        await pool.query(
+            `UPDATE accounts SET client_email = COALESCE(client_email, $2), updated_at = now() WHERE id = $1`,
+            [accountId, request.authenticatedUser?.email || null]
+        );
+
+        response.json({ success: true, inboxEmail });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to save Xero Files email." });
+    }
+});
+
+app.post("/billing/checkout-session", requireActiveUser, async (request, response) => {
+    try {
+        if (!STRIPE_SECRET_KEY) {
+            response.status(503).json({ message: "Stripe secret key is not configured." });
+            return;
+        }
+        if (!STRIPE_PRICE_GBP_MONTHLY_ID) {
+            response.status(503).json({ message: "Stripe monthly price ID is not configured." });
+            return;
+        }
+
+        const accountId = normalizeOptionalString(request.body?.accountId || request.query?.accountId);
+        if (!await requireAuthorizedAccountAccess(request, response, accountId, { allowCreate: false })) {
+            return;
+        }
+
+        await ensureCoreModelTables();
+        const accountResult = await pool.query(
+            `SELECT * FROM accounts WHERE id = $1 LIMIT 1`,
+            [accountId]
+        );
+        const account = accountResult.rows[0];
+        if (!account) {
+            response.status(404).json({ message: "Account not found." });
+            return;
+        }
+
+        const successURL = stripeCheckoutSuccessURL(request);
+        const cancelURL = stripeCheckoutCancelURL(request);
+
+        const form = new URLSearchParams();
+        form.set("mode", "subscription");
+        form.set("success_url", successURL);
+        form.set("cancel_url", cancelURL);
+        form.set("line_items[0][price]", STRIPE_PRICE_GBP_MONTHLY_ID);
+        form.set("line_items[0][quantity]", "1");
+        form.set("metadata[accountId]", accountId);
+        form.set("metadata[userId]", request.authenticatedUser.id);
+        form.set("metadata[userEmail]", request.authenticatedUser.email);
+        form.set("subscription_data[metadata][accountId]", accountId);
+        form.set("subscription_data[metadata][userId]", request.authenticatedUser.id);
+        form.set("subscription_data[metadata][userEmail]", request.authenticatedUser.email);
+        form.set("client_reference_id", accountId);
+        form.set("customer_email", request.authenticatedUser.email);
+
+        if (account.stripe_customer_id) {
+            form.set("customer", account.stripe_customer_id);
+        }
+
+        const checkoutResponse = await fetch(`${STRIPE_API_BASE_URL}/checkout/sessions`, {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${STRIPE_SECRET_KEY}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: form
+        });
+
+        const checkoutBody = await checkoutResponse.json().catch(() => ({}));
+        if (!checkoutResponse.ok) {
+            response.status(502).json({ message: checkoutBody?.error?.message || "Unable to create Stripe checkout session." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "billing.checkout_started",
+            targetType: "workspace",
+            targetId: accountId,
+            details: {
+                category: "billing",
+                actionTitle: "Started paid subscription checkout",
+                targetName: account.company_name || accountId,
+                detail: `Stripe checkout started for ${account.company_name || accountId}.`
+            }
+        });
+
+        response.json({
+            success: true,
+            checkoutURL: checkoutBody.url,
+            sessionId: checkoutBody.id
+        });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to create Stripe checkout session." });
     }
 });
 
@@ -885,10 +1103,15 @@ app.get("/xero/status", async (request, response) => {
         }
 
         const connection = await ensureFreshXeroConnection(accountId);
+        const missingScopes = missingXeroScopes(connection, ["accounting.attachments"]);
+        const requiresReconnect = missingScopes.length > 0;
+        const statusMessage = requiresReconnect
+            ? `Reconnect Xero to grant the required scope: ${missingScopes.join(", ")}.`
+            : null;
 
         response.json({
             isConnected: true,
-            requiresReconnect: false,
+            requiresReconnect,
             connectedUserEmail: connection.connectedUserEmail || null,
             selectedTenantId: connection.selectedTenantId || null,
             selectedTenantName: connection.selectedTenantName || null,
@@ -901,7 +1124,8 @@ app.get("/xero/status", async (request, response) => {
             contactsSynced: Boolean(connection.contactsLastSyncedAt),
             chartOfAccountsLastSyncedAt: connection.chartOfAccountsLastSyncedAt || null,
             contactsLastSyncedAt: connection.contactsLastSyncedAt || null,
-            chartOfAccountsCount: Array.isArray(connection.chartOfAccounts) ? connection.chartOfAccounts.length : 0
+            chartOfAccountsCount: Array.isArray(connection.chartOfAccounts) ? connection.chartOfAccounts.length : 0,
+            message: statusMessage
         });
     } catch (error) {
         sendXeroError(response, error, "Unable to fetch Xero status.");
@@ -1602,6 +1826,14 @@ app.get("/admin/audit-trail", async (_request, response) => {
     }
 });
 
+app.get("/admin/subscriptions", async (_request, response) => {
+    try {
+        response.json({ subscriptions: await listAdminSubscriptions() });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load paid subscriptions." });
+    }
+});
+
 app.patch("/admin/workspaces/:accountId/suspension", async (request, response) => {
     try {
         const { accountId } = request.params;
@@ -1636,6 +1868,23 @@ app.patch("/admin/workspaces/:accountId/registry", async (request, response) => 
     } catch (error) {
         const status = error?.statusCode || 500;
         response.status(status).json({ message: error instanceof Error ? error.message : "Unable to update workspace registry." });
+    }
+});
+
+app.patch("/admin/workspaces/:accountId/billing", async (request, response) => {
+    try {
+        const { accountId } = request.params;
+        const { billingMode, actorEmail } = request.body;
+        await updateWorkspaceBilling({
+            accountId,
+            billingMode,
+            actorEmail,
+            request
+        });
+        response.json({ success: true });
+    } catch (error) {
+        const status = error?.statusCode || 500;
+        response.status(status).json({ message: error instanceof Error ? error.message : "Unable to update workspace billing." });
     }
 });
 
@@ -2061,6 +2310,14 @@ async function ensureCoreModelTables() {
     await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS requires_reconnect boolean NOT NULL DEFAULT false`);
     await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS last_connected_at timestamptz`);
     await pool.query(`ALTER TABLE xero_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS billing_mode text NOT NULL DEFAULT 'free'`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'free'`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS stripe_customer_id text`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS stripe_subscription_id text`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_amount_pence integer NOT NULL DEFAULT ${JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE}`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_started_at timestamptz`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_current_period_end timestamptz`);
+    await pool.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subscription_updated_at timestamptz`);
 
     await pool.query(`
         CREATE TABLE IF NOT EXISTS jentry_inboxes (
@@ -2090,14 +2347,38 @@ async function ensureCoreModelTables() {
     `);
 }
 
-async function upsertAccountRecord({ accountId, clientId = null, companyName = null, natureOfBusiness = null, isVatRegistered = null, status = null, assignedUserId = null, clientEmail = null } = {}) {
+async function upsertAccountRecord({
+    accountId,
+    clientId = null,
+    companyName = null,
+    natureOfBusiness = null,
+    isVatRegistered = null,
+    status = null,
+    assignedUserId = null,
+    clientEmail = null,
+    billingMode = null,
+    subscriptionStatus = null,
+    stripeCustomerId = null,
+    stripeSubscriptionId = null,
+    subscriptionAmountPence = null,
+    subscriptionStartedAt = null,
+    subscriptionCurrentPeriodEnd = null
+} = {}) {
     const id = normalizeOptionalString(accountId);
     if (!id) return null;
     await ensureCoreModelTables();
     const result = await pool.query(
         `
-        INSERT INTO accounts (id, client_id, company_name, nature_of_business, is_vat_registered, status, assigned_user_id, client_email, updated_at)
-        VALUES ($1, $2, $3, $4, COALESCE($5, false), COALESCE($6, 'active'), $7, $8, now())
+        INSERT INTO accounts (
+            id, client_id, company_name, nature_of_business, is_vat_registered, status, assigned_user_id, client_email,
+            billing_mode, subscription_status, stripe_customer_id, stripe_subscription_id, subscription_amount_pence,
+            subscription_started_at, subscription_current_period_end, subscription_updated_at, updated_at
+        )
+        VALUES (
+            $1, $2, $3, $4, COALESCE($5, false), COALESCE($6, 'active'), $7, $8,
+            COALESCE($9, 'free'), COALESCE($10, 'free'), $11, $12, COALESCE($13, ${JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE}),
+            $14, $15, now(), now()
+        )
         ON CONFLICT (id)
         DO UPDATE SET
             client_id = COALESCE(EXCLUDED.client_id, accounts.client_id),
@@ -2107,10 +2388,34 @@ async function upsertAccountRecord({ accountId, clientId = null, companyName = n
             status = COALESCE(EXCLUDED.status, accounts.status),
             assigned_user_id = COALESCE(EXCLUDED.assigned_user_id, accounts.assigned_user_id),
             client_email = COALESCE(EXCLUDED.client_email, accounts.client_email),
+            billing_mode = COALESCE(EXCLUDED.billing_mode, accounts.billing_mode),
+            subscription_status = COALESCE(EXCLUDED.subscription_status, accounts.subscription_status),
+            stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, accounts.stripe_customer_id),
+            stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, accounts.stripe_subscription_id),
+            subscription_amount_pence = COALESCE(EXCLUDED.subscription_amount_pence, accounts.subscription_amount_pence),
+            subscription_started_at = COALESCE(EXCLUDED.subscription_started_at, accounts.subscription_started_at),
+            subscription_current_period_end = COALESCE(EXCLUDED.subscription_current_period_end, accounts.subscription_current_period_end),
+            subscription_updated_at = now(),
             updated_at = now()
         RETURNING *
         `,
-        [id, clientId, companyName, natureOfBusiness, isVatRegistered, status, assignedUserId, clientEmail]
+        [
+            id,
+            clientId,
+            companyName,
+            natureOfBusiness,
+            isVatRegistered,
+            status,
+            assignedUserId,
+            clientEmail,
+            billingMode,
+            subscriptionStatus,
+            stripeCustomerId,
+            stripeSubscriptionId,
+            subscriptionAmountPence,
+            subscriptionStartedAt,
+            subscriptionCurrentPeriodEnd
+        ]
     );
     return mapAccountRow(result.rows[0]);
 }
@@ -2195,7 +2500,21 @@ async function buildAdminOverview() {
                 COUNT(*)::int AS total,
                 COUNT(*) FILTER (
                     WHERE a.status = 'suspended' OR COALESCE(u.is_suspended, false) = true
-                )::int AS suspended
+                )::int AS suspended,
+                COUNT(*) FILTER (WHERE COALESCE(a.billing_mode, 'free') = 'free')::int AS free_accounts,
+                COUNT(*) FILTER (WHERE COALESCE(a.billing_mode, 'free') <> 'free')::int AS paid_accounts,
+                COUNT(*) FILTER (
+                    WHERE COALESCE(a.billing_mode, 'free') <> 'free'
+                      AND COALESCE(a.subscription_status, 'free') IN ('active', 'trialing', 'paid')
+                )::int AS active_paid_accounts,
+                COALESCE(SUM(
+                    CASE
+                        WHEN COALESCE(a.billing_mode, 'free') <> 'free'
+                         AND COALESCE(a.subscription_status, 'free') IN ('active', 'trialing', 'paid')
+                        THEN COALESCE(a.subscription_amount_pence, ${JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE})
+                        ELSE 0
+                    END
+                ), 0)::int AS monthly_recurring_revenue_pence
             FROM accounts a
             LEFT JOIN users u ON u.id = a.assigned_user_id
         `),
@@ -2232,7 +2551,11 @@ async function buildAdminOverview() {
         suspendedCount: Number(accounts.rows[0]?.suspended || 0),
         reconnectNeededCount: Number(xero.rows[0]?.reconnect_needed || 0),
         activeTodayCount: Number(activeToday.rows[0]?.active_today || 0),
-        submissionsTodayCount: Number(submissionsToday.rows[0]?.submissions_today || 0)
+        submissionsTodayCount: Number(submissionsToday.rows[0]?.submissions_today || 0),
+        freeAccountsCount: Number(accounts.rows[0]?.free_accounts || 0),
+        paidAccountsCount: Number(accounts.rows[0]?.paid_accounts || 0),
+        activePaidAccountsCount: Number(accounts.rows[0]?.active_paid_accounts || 0),
+        monthlyRecurringRevenuePence: Number(accounts.rows[0]?.monthly_recurring_revenue_pence || 0)
     };
 }
 
@@ -2249,6 +2572,13 @@ async function listAdminWorkspaces() {
             a.nature_of_business,
             a.is_vat_registered,
             a.status,
+            a.billing_mode,
+            a.subscription_status,
+            a.subscription_amount_pence,
+            a.subscription_started_at,
+            a.subscription_current_period_end,
+            a.stripe_customer_id,
+            a.stripe_subscription_id,
             a.last_submission_at,
             u.email AS assigned_user_email,
             u.display_name AS assigned_user_display_name,
@@ -2278,6 +2608,31 @@ async function listAdminWorkspaces() {
     `);
 
     return result.rows.map(mapAdminWorkspaceRow);
+}
+
+async function listAdminSubscriptions() {
+    await ensureCoreModelTables();
+    const result = await pool.query(`
+        SELECT
+            a.id AS account_id,
+            a.company_name,
+            a.client_email,
+            a.billing_mode,
+            a.subscription_status,
+            a.subscription_amount_pence,
+            a.subscription_started_at,
+            a.subscription_current_period_end,
+            a.stripe_customer_id,
+            a.stripe_subscription_id,
+            xc.tenant_id,
+            xc.tenant_name
+        FROM accounts a
+        LEFT JOIN xero_connections xc ON xc.account_id = a.id
+        WHERE COALESCE(a.billing_mode, 'free') <> 'free'
+           OR COALESCE(a.subscription_status, 'free') <> 'free'
+        ORDER BY a.company_name NULLS LAST, a.created_at DESC
+    `);
+    return result.rows.map(mapAdminSubscriptionRow);
 }
 
 async function listAdminAuditTrail() {
@@ -2350,6 +2705,62 @@ async function setWorkspaceSuspension({ accountId, isSuspended, reason = null, a
             detail: nextSuspended
                 ? `${companyName} was suspended and will be blocked on next access.`
                 : `${companyName} was re-enabled and can access Jentry again.`
+        }
+    });
+}
+
+async function updateWorkspaceBilling({ accountId, billingMode, actorEmail, request } = {}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    if (!normalizedAccountId) {
+        const error = new Error("Missing accountId.");
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const nextBillingMode = normalizeBillingMode(billingMode);
+    const normalizedActorEmail = ensureAllowedActor(actorEmail, request);
+
+    await ensureCoreModelTables();
+
+    const before = await pool.query(`SELECT * FROM accounts WHERE id = $1 LIMIT 1`, [normalizedAccountId]);
+    const beforeRow = before.rows[0];
+    if (!beforeRow) {
+        const error = new Error("Workspace not found.");
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const nextSubscriptionStatus = nextBillingMode === "free"
+        ? "free"
+        : (isPaidSubscriptionActive(beforeRow.subscription_status) ? beforeRow.subscription_status : "inactive");
+
+    await pool.query(
+        `
+        UPDATE accounts
+        SET billing_mode = $2,
+            subscription_status = $3,
+            subscription_amount_pence = COALESCE(subscription_amount_pence, $4),
+            subscription_updated_at = now(),
+            updated_at = now()
+        WHERE id = $1
+        `,
+        [normalizedAccountId, nextBillingMode, nextSubscriptionStatus, JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE]
+    );
+
+    await writeAdminAuditLog(request, {
+        action: nextBillingMode === "free" ? "billing.marked_free" : "billing.marked_paid_required",
+        targetType: "workspace",
+        targetId: normalizedAccountId,
+        actorEmail: normalizedActorEmail,
+        details: {
+            category: "billing",
+            actionTitle: nextBillingMode === "free" ? "Made account free" : "Made account paid",
+            targetName: beforeRow.company_name || normalizedAccountId,
+            beforeSummary: `${beforeRow.billing_mode || "free"} â€¢ ${beforeRow.subscription_status || "free"}`,
+            afterSummary: `${nextBillingMode} â€¢ ${nextSubscriptionStatus}`,
+            detail: nextBillingMode === "free"
+                ? `${beforeRow.company_name || normalizedAccountId} now uses the free Jaccountancy plan.`
+                : `${beforeRow.company_name || normalizedAccountId} now requires the Â£${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP}/month paid plan.`
         }
     });
 }
@@ -2478,7 +2889,14 @@ function mapAdminWorkspaceRow(row) {
         suspensionReason: row.assigned_user_suspension_reason || null,
         suspendedAt: null,
         natureOfBusiness: row.nature_of_business || null,
-        isVATRegistered: Boolean(row.is_vat_registered)
+        isVATRegistered: Boolean(row.is_vat_registered),
+        billingMode: normalizeBillingMode(row.billing_mode),
+        subscriptionStatus: normalizeSubscriptionStatus(row.subscription_status),
+        subscriptionAmountPence: Number(row.subscription_amount_pence || JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE),
+        subscriptionStartedAt: toISODateTime(row.subscription_started_at),
+        subscriptionCurrentPeriodEnd: toISODateTime(row.subscription_current_period_end),
+        stripeCustomerID: row.stripe_customer_id || null,
+        stripeSubscriptionID: row.stripe_subscription_id || null
     };
 }
 
@@ -2517,6 +2935,101 @@ async function writeAdminAuditLog(request, { action, targetType, targetId, detai
     );
 }
 
+async function handleStripeWebhookEvent(event) {
+    const eventType = normalizeOptionalString(event?.type);
+    const object = event?.data?.object || {};
+
+    if (eventType === "checkout.session.completed") {
+        await syncStripeSubscriptionToAccount({
+            accountId: normalizeOptionalString(object?.metadata?.accountId || object?.client_reference_id),
+            stripeCustomerId: normalizeOptionalString(object?.customer),
+            stripeSubscriptionId: normalizeOptionalString(object?.subscription)
+        });
+        return;
+    }
+
+    if (eventType === "customer.subscription.updated" || eventType === "customer.subscription.created") {
+        await applyStripeSubscriptionRecord(object);
+        return;
+    }
+
+    if (eventType === "customer.subscription.deleted") {
+        await applyStripeSubscriptionRecord(object, { forceInactive: true });
+    }
+}
+
+async function syncStripeSubscriptionToAccount({ accountId, stripeCustomerId, stripeSubscriptionId } = {}) {
+    if (!STRIPE_SECRET_KEY || !accountId || !stripeSubscriptionId) return;
+
+    const subscriptionResponse = await fetch(`${STRIPE_API_BASE_URL}/subscriptions/${encodeURIComponent(stripeSubscriptionId)}`, {
+        headers: { Authorization: `Bearer ${STRIPE_SECRET_KEY}` }
+    });
+    const subscription = await subscriptionResponse.json().catch(() => null);
+    if (!subscriptionResponse.ok || !subscription) return;
+
+    await applyStripeSubscriptionRecord(subscription, { accountIdOverride: accountId, stripeCustomerIdOverride: stripeCustomerId });
+}
+
+async function applyStripeSubscriptionRecord(subscription, { forceInactive = false, accountIdOverride = "", stripeCustomerIdOverride = "" } = {}) {
+    const subscriptionId = normalizeOptionalString(subscription?.id);
+    if (!subscriptionId) return;
+
+    const metadataAccountId = normalizeOptionalString(subscription?.metadata?.accountId);
+    const stripeCustomerId = normalizeOptionalString(stripeCustomerIdOverride || subscription?.customer);
+    const nextStatus = forceInactive ? "inactive" : normalizeSubscriptionStatus(subscription?.status);
+    const accountId = metadataAccountId || normalizeOptionalString(accountIdOverride);
+
+    await ensureCoreModelTables();
+
+    let resolvedAccountId = accountId;
+    if (!resolvedAccountId) {
+        const lookup = await pool.query(
+            `SELECT id FROM accounts WHERE stripe_subscription_id = $1 OR stripe_customer_id = $2 LIMIT 1`,
+            [subscriptionId, stripeCustomerId || null]
+        );
+        resolvedAccountId = lookup.rows[0]?.id || "";
+    }
+
+    if (!resolvedAccountId) return;
+
+    const priceAmountPence = Number(
+        subscription?.items?.data?.[0]?.price?.unit_amount
+        || subscription?.plan?.amount
+        || JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE
+    );
+    const subscriptionStartedAt = subscription?.current_period_start
+        ? new Date(Number(subscription.current_period_start) * 1000).toISOString()
+        : null;
+    const subscriptionCurrentPeriodEnd = subscription?.current_period_end
+        ? new Date(Number(subscription.current_period_end) * 1000).toISOString()
+        : null;
+
+    await pool.query(
+        `
+        UPDATE accounts
+        SET billing_mode = 'paid_required',
+            subscription_status = $2,
+            stripe_customer_id = COALESCE($3, stripe_customer_id),
+            stripe_subscription_id = $4,
+            subscription_amount_pence = $5,
+            subscription_started_at = COALESCE($6::timestamptz, subscription_started_at),
+            subscription_current_period_end = $7::timestamptz,
+            subscription_updated_at = now(),
+            updated_at = now()
+        WHERE id = $1
+        `,
+        [
+            resolvedAccountId,
+            nextStatus,
+            stripeCustomerId || null,
+            subscriptionId,
+            priceAmountPence,
+            subscriptionStartedAt,
+            subscriptionCurrentPeriodEnd
+        ]
+    );
+}
+
 function mapUserRow(row) {
     if (!row) return null;
     return {
@@ -2544,6 +3057,13 @@ function mapAccountRow(row) {
         natureOfBusiness: row.nature_of_business || null,
         isVatRegistered: Boolean(row.is_vat_registered),
         status: row.status || null,
+        billingMode: normalizeBillingMode(row.billing_mode),
+        subscriptionStatus: normalizeSubscriptionStatus(row.subscription_status),
+        subscriptionAmountPence: Number(row.subscription_amount_pence || JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE),
+        subscriptionStartedAt: row.subscription_started_at || null,
+        subscriptionCurrentPeriodEnd: row.subscription_current_period_end || null,
+        stripeCustomerId: row.stripe_customer_id || null,
+        stripeSubscriptionId: row.stripe_subscription_id || null,
         assignedUserId: row.assigned_user_id || null,
         lastSubmissionAt: row.last_submission_at || null,
         createdAt: row.created_at || null,
@@ -2587,7 +3107,42 @@ function mapAdminAccountRow(row) {
         requiresReconnect: Boolean(row.requires_reconnect),
         tenantId: row.tenant_id || null,
         tenantName: row.tenant_name || null,
-        status: row.status || null
+        status: row.status || null,
+        billingMode: normalizeBillingMode(row.billing_mode),
+        subscriptionStatus: normalizeSubscriptionStatus(row.subscription_status)
+    };
+}
+
+function mapAccountAccessStatusRow(row) {
+    return {
+        accountId: row.id,
+        companyName: row.company_name || null,
+        isSuspended: row.status === "suspended",
+        billingMode: normalizeBillingMode(row.billing_mode),
+        subscriptionStatus: normalizeSubscriptionStatus(row.subscription_status),
+        subscriptionAmountPence: Number(row.subscription_amount_pence || JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE),
+        subscriptionStartedAt: row.subscription_started_at || null,
+        subscriptionCurrentPeriodEnd: row.subscription_current_period_end || null,
+        stripeCustomerId: row.stripe_customer_id || null,
+        stripeSubscriptionId: row.stripe_subscription_id || null,
+        requiresPaidSubscription: isBillingBlockedRow(row)
+    };
+}
+
+function mapAdminSubscriptionRow(row) {
+    return {
+        accountId: row.account_id,
+        companyName: row.company_name || null,
+        clientEmail: row.client_email || null,
+        tenantId: row.tenant_id || null,
+        tenantName: row.tenant_name || null,
+        billingMode: normalizeBillingMode(row.billing_mode),
+        subscriptionStatus: normalizeSubscriptionStatus(row.subscription_status),
+        subscriptionAmountPence: Number(row.subscription_amount_pence || JENTRY_PAID_SUBSCRIPTION_AMOUNT_PENCE),
+        subscriptionStartedAt: row.subscription_started_at || null,
+        subscriptionCurrentPeriodEnd: row.subscription_current_period_end || null,
+        stripeCustomerId: row.stripe_customer_id || null,
+        stripeSubscriptionId: row.stripe_subscription_id || null
     };
 }
 
@@ -2979,6 +3534,92 @@ function normalizeOptionalString(value) {
     return trimmed ? trimmed : "";
 }
 
+function normalizeBillingMode(value) {
+    const normalized = normalizeOptionalString(value).toLowerCase();
+    if (normalized === "paid_required" || normalized === "subscribed" || normalized === "free") {
+        return normalized;
+    }
+    return "free";
+}
+
+function normalizeSubscriptionStatus(value) {
+    const normalized = normalizeOptionalString(value).toLowerCase();
+    return normalized || "free";
+}
+
+function isPaidSubscriptionActive(status) {
+    return new Set(["active", "trialing", "paid"]).has(normalizeSubscriptionStatus(status));
+}
+
+function isFreeJaccountancyClient(email) {
+    const normalizedEmail = normalizeEmail(email);
+    const domain = normalizedEmail.split("@")[1] || "";
+    return Boolean(domain) && JACCOUNTANCY_FREE_CLIENT_DOMAINS.has(domain);
+}
+
+function isBillingBlockedRow(row) {
+    const billingMode = normalizeBillingMode(row?.billing_mode);
+    const subscriptionStatus = normalizeSubscriptionStatus(row?.subscription_status);
+    return billingMode === "paid_required" && !isPaidSubscriptionActive(subscriptionStatus);
+}
+
+function stripeCheckoutSuccessURL(request) {
+    return normalizeOptionalString(
+        process.env.STRIPE_SUCCESS_URL ||
+        request.body?.successURL ||
+        request.body?.successUrl ||
+        request.query?.successURL ||
+        request.query?.successUrl
+    ) || "jentry://subscription-success?session_id={CHECKOUT_SESSION_ID}";
+}
+
+function stripeCheckoutCancelURL(request) {
+    return normalizeOptionalString(
+        process.env.STRIPE_CANCEL_URL ||
+        request.body?.cancelURL ||
+        request.body?.cancelUrl ||
+        request.query?.cancelURL ||
+        request.query?.cancelUrl
+    ) || "jentry://subscription-cancelled";
+}
+
+function verifyStripeWebhookEvent(rawBody, stripeSignature, webhookSecret) {
+    if (!Buffer.isBuffer(rawBody)) {
+        throw new Error("Stripe webhook body must be raw bytes.");
+    }
+
+    const timestamp = normalizeOptionalString(
+        stripeSignature
+            .split(",")
+            .find((entry) => entry.startsWith("t="))
+            ?.slice(2)
+    );
+    const signature = normalizeOptionalString(
+        stripeSignature
+            .split(",")
+            .find((entry) => entry.startsWith("v1="))
+            ?.slice(3)
+    );
+
+    if (!timestamp || !signature) {
+        throw new Error("Stripe webhook signature is invalid.");
+    }
+
+    const expected = crypto
+        .createHmac("sha256", webhookSecret)
+        .update(`${timestamp}.${rawBody.toString("utf8")}`, "utf8")
+        .digest("hex");
+
+    const expectedBuffer = Buffer.from(expected, "hex");
+    const signatureBuffer = Buffer.from(signature, "hex");
+
+    if (expectedBuffer.length !== signatureBuffer.length || !crypto.timingSafeEqual(expectedBuffer, signatureBuffer)) {
+        throw new Error("Stripe webhook signature verification failed.");
+    }
+
+    return JSON.parse(rawBody.toString("utf8"));
+}
+
 function buildXeroHistoryDetail(metadata = {}) {
     const submittedByName = normalizeOptionalString(metadata.submittedByName);
     const submittedByEmail = normalizeOptionalString(metadata.submittedByEmail);
@@ -3093,6 +3734,10 @@ function hasXeroScope(connection, requiredScope) {
         .filter(Boolean);
 
     return grantedScopes.includes(normalizedScope);
+}
+
+function missingXeroScopes(connection, requiredScopes = []) {
+    return requiredScopes.filter((scope) => !hasXeroScope(connection, scope));
 }
 
 function toBase64Url(value) {
@@ -4182,6 +4827,7 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
     let attachmentsUploaded = true;
     let warning = null;
     const historyDetail = buildXeroHistoryDetail(metadata);
+    const canUploadAttachments = hasXeroScope(connection, "accounting.attachments");
 
     try {
         await addXeroInvoiceHistory({
@@ -4201,25 +4847,31 @@ async function createXeroLedgerDocument(accountId, metadata, documentFiles) {
         });
     }
 
-    for (const file of documentFiles.slice(0, 10)) {
-        try {
-            await uploadAttachmentToXero({
-                accessToken: connection.accessToken,
-                tenantId: connection.selectedTenantId,
-                invoiceId: invoice.InvoiceID,
-                file
-            });
-        } catch (error) {
-            attachmentsUploaded = false;
-            const attachmentWarning = error instanceof Error
-                ? `Published to Xero, but attachment upload failed: ${error.message}`
-                : "Published to Xero, but attachment upload failed.";
-            warning = warning ? `${warning} ${attachmentWarning}` : attachmentWarning;
-            console.warn("Xero attachment upload failed after invoice creation.", {
-                invoiceId: invoice.InvoiceID,
-                message: warning
-            });
-            break;
+    if (!canUploadAttachments) {
+        attachmentsUploaded = false;
+        const attachmentWarning = "Published to Xero, but attachment upload is blocked until Xero is reconnected with the accounting.attachments scope.";
+        warning = warning ? `${warning} ${attachmentWarning}` : attachmentWarning;
+    } else {
+        for (const file of documentFiles.slice(0, 10)) {
+            try {
+                await uploadAttachmentToXero({
+                    accessToken: connection.accessToken,
+                    tenantId: connection.selectedTenantId,
+                    invoiceId: invoice.InvoiceID,
+                    file
+                });
+            } catch (error) {
+                attachmentsUploaded = false;
+                const attachmentWarning = error instanceof Error
+                    ? `Published to Xero, but attachment upload failed: ${error.message}`
+                    : "Published to Xero, but attachment upload failed.";
+                warning = warning ? `${warning} ${attachmentWarning}` : attachmentWarning;
+                console.warn("Xero attachment upload failed after invoice creation.", {
+                    invoiceId: invoice.InvoiceID,
+                    message: warning
+                });
+                break;
+            }
         }
     }
 
