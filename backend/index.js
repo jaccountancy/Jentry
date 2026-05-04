@@ -44,6 +44,12 @@ for (const key of requiredEnvironmentVariables) {
 }
 
 const app = express();
+app.get("/stripe/webhook", (_request, response) => {
+    response.status(200).json({ ok: true, endpoint: "stripe-webhook" });
+});
+app.head("/stripe/webhook", (_request, response) => {
+    response.status(200).end();
+});
 app.post("/stripe/webhook", express.raw({ type: "application/json", limit: "2mb" }), async (request, response) => {
     try {
         if (!STRIPE_WEBHOOK_SECRET) {
