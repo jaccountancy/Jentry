@@ -1894,6 +1894,22 @@ app.patch("/admin/workspaces/:accountId/billing", async (request, response) => {
     }
 });
 
+app.delete("/admin/workspaces/:accountId", async (request, response) => {
+    try {
+        const { accountId } = request.params;
+        const { actorEmail } = request.body || {};
+        await deleteWorkspace({
+            accountId,
+            actorEmail,
+            request
+        });
+        response.json({ success: true });
+    } catch (error) {
+        const status = error?.statusCode || 500;
+        response.status(status).json({ message: error instanceof Error ? error.message : "Unable to delete workspace." });
+    }
+});
+
 app.get("/admin/users", async (_request, response) => {
     try {
         await ensureCoreModelTables();
@@ -2146,6 +2162,7 @@ app.listen(port, () => {
             "GET /admin/audit-trail",
             "PATCH /admin/workspaces/:accountId/suspension",
             "PATCH /admin/workspaces/:accountId/registry",
+            "DELETE /admin/workspaces/:accountId",
             "GET /admin/users",
             "PATCH /admin/users/:userId/suspension",
             "GET /admin/accounts",
@@ -2852,6 +2869,113 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
             beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" Ã¢â‚¬Â¢ ") || "No registry record",
             afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" Ã¢â‚¬Â¢ "),
             detail: `${targetName} registry details were updated.`
+        }
+    });
+}
+
+async function deleteWorkspace({ accountId, actorEmail, request } = {}) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    if (!normalizedAccountId) {
+        const error = new Error("Missing accountId.");
+        error.statusCode = 400;
+        throw error;
+    }
+
+    const normalizedActorEmail = ensureAllowedActor(actorEmail, request);
+
+    await ensureCoreModelTables();
+    await ensureInboundEmailSubmissionsTable().catch(() => undefined);
+    await ensureInboundEmailAttachmentsTable().catch(() => undefined);
+    await ensureProcessedInboundSubmissionsTable().catch(() => undefined);
+    await ensureXeroAuthSessionsTable().catch(() => undefined);
+    await ensureXeroPublishRecordsTable().catch(() => undefined);
+
+    const before = await pool.query(
+        `
+        SELECT
+            a.*,
+            u.email AS assigned_user_email,
+            u.is_super_admin AS assigned_user_is_super_admin
+        FROM accounts a
+        LEFT JOIN users u ON u.id = a.assigned_user_id
+        WHERE a.id = $1
+        LIMIT 1
+        `,
+        [normalizedAccountId]
+    );
+
+    const beforeRow = before.rows[0];
+    if (!beforeRow) {
+        const error = new Error("Workspace not found.");
+        error.statusCode = 404;
+        throw error;
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+
+        await client.query(
+            `
+            DELETE FROM inbound_email_attachments
+            WHERE submission_id IN (
+                SELECT id
+                FROM inbound_email_submissions
+                WHERE account_id = $1
+            )
+            `,
+            [normalizedAccountId]
+        ).catch(() => undefined);
+
+        await client.query(`DELETE FROM inbound_email_submissions WHERE account_id = $1`, [normalizedAccountId]).catch(() => undefined);
+        await client.query(`DELETE FROM processed_inbound_submissions WHERE account_id = $1`, [normalizedAccountId]).catch(() => undefined);
+        await client.query(`DELETE FROM xero_publish_records WHERE account_id = $1`, [normalizedAccountId]).catch(() => undefined);
+        await client.query(`DELETE FROM xero_auth_sessions WHERE account_id = $1`, [normalizedAccountId]).catch(() => undefined);
+        await client.query(`DELETE FROM xero_connections WHERE account_id = $1`, [normalizedAccountId]);
+        await client.query(`DELETE FROM jentry_inboxes WHERE account_id = $1`, [normalizedAccountId]);
+        await client.query(`DELETE FROM memberships WHERE account_id = $1`, [normalizedAccountId]);
+        await client.query(`DELETE FROM accounts WHERE id = $1`, [normalizedAccountId]);
+
+        const assignedUserId = normalizeOptionalString(beforeRow.assigned_user_id);
+        if (assignedUserId && !beforeRow.assigned_user_is_super_admin) {
+            const remainingUsage = await client.query(
+                `
+                SELECT
+                    EXISTS(SELECT 1 FROM memberships WHERE user_id = $1) AS has_memberships,
+                    EXISTS(SELECT 1 FROM accounts WHERE assigned_user_id = $1) AS has_assigned_accounts,
+                    EXISTS(SELECT 1 FROM jentry_inboxes WHERE assigned_user_id = $1) AS has_assigned_inboxes
+                `,
+                [assignedUserId]
+            );
+
+            const usage = remainingUsage.rows[0] || {};
+            const stillReferenced = usage.has_memberships || usage.has_assigned_accounts || usage.has_assigned_inboxes;
+            if (!stillReferenced) {
+                await client.query(`DELETE FROM users WHERE id = $1`, [assignedUserId]);
+            }
+        }
+
+        await client.query("COMMIT");
+    } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+    } finally {
+        client.release();
+    }
+
+    const targetName = beforeRow.company_name || beforeRow.assigned_user_email || normalizedAccountId;
+    await writeAdminAuditLog(request, {
+        action: "workspace.deleted",
+        targetType: "workspace",
+        targetId: normalizedAccountId,
+        actorEmail: normalizedActorEmail,
+        details: {
+            category: "clients",
+            actionTitle: "Deleted workspace",
+            targetName,
+            beforeSummary: [beforeRow.company_name, beforeRow.client_email, beforeRow.client_id].filter(Boolean).join(" â€¢ ") || normalizedAccountId,
+            afterSummary: "Deleted",
+            detail: `${targetName} and its linked submitted data were deleted from the live admin console.`
         }
     });
 }
