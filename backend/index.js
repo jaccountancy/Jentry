@@ -308,6 +308,30 @@ async function getOrCreateUserFromEmail({ email, displayName = "", loginEvent = 
     return mapUserRow(result.rows[0]);
 }
 
+function legacyXeroAccountEmail(accountId) {
+    const normalizedAccountId = normalizeOptionalString(accountId);
+    if (!normalizedAccountId) return null;
+
+    const digest = crypto
+        .createHash("sha256")
+        .update(normalizedAccountId)
+        .digest("hex")
+        .slice(0, 24);
+
+    return `xero-account-${digest}@jentry.local`;
+}
+
+async function getOrCreateLegacyXeroUserForAccount({ accountId, displayName = "" } = {}) {
+    const email = legacyXeroAccountEmail(accountId);
+    if (!email) return null;
+
+    return getOrCreateUserFromEmail({
+        email,
+        displayName: normalizeOptionalString(displayName) || "Jentry Xero Connection",
+        loginEvent: false
+    });
+}
+
 async function requireActiveUserOrXeroStartToken(request, response, next) {
     const tokenPayload = verifyXeroOAuthStartToken(request.query?.xeroAuthToken || request.query?.authToken || request.query?.token);
 
@@ -340,6 +364,53 @@ async function requireActiveUserOrXeroStartToken(request, response, next) {
     }
 
     await requireActiveUser(request, response, next);
+}
+
+async function requireActiveUserOrLegacyXeroAccount(request, response, next) {
+    try {
+        const user = await getOrCreateAuthenticatedUser(request);
+        if (user) {
+            if (user.isSuspended) {
+                sendSuspendedResponse(response);
+                return;
+            }
+
+            request.authenticatedUser = user;
+            next();
+            return;
+        }
+
+        const accountId = normalizeOptionalString(
+            request.body?.accountId ||
+            request.query?.accountId
+        );
+
+        if (!accountId) {
+            response.status(401).json({ code: "AUTH_REQUIRED", message: "Authentication required." });
+            return;
+        }
+
+        // Compatibility mode for the current iOS client, which still calls Xero routes without a real app session.
+        const legacyUser = await getOrCreateLegacyXeroUserForAccount({
+            accountId,
+            displayName: request.headers["x-user-display-name"] || request.body?.displayName
+        });
+
+        if (!legacyUser) {
+            response.status(401).json({ code: "AUTH_REQUIRED", message: "Authentication required." });
+            return;
+        }
+
+        if (legacyUser.isSuspended) {
+            sendSuspendedResponse(response);
+            return;
+        }
+
+        request.authenticatedUser = legacyUser;
+        next();
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to authenticate user." });
+    }
 }
 
 function extractAuthenticatedEmail(request) {
@@ -554,9 +625,13 @@ app.use([
     "/xero/publish-bill",
     "/xero/attach-document",
     "/xero/contacts",
-    "/xero/ensure-contact",
+    "/xero/ensure-contact"
+], requireActiveUserOrLegacyXeroAccount);
+
+app.use([
     "/jentry/uploads",
     "/jentry/inbox/register",
+    "/inbound-email-addresses/register",
     "/inbound-email-submissions",
     "/analyze",
     "/jentry/analyze",
@@ -564,7 +639,7 @@ app.use([
     "/jentry/problem-report"
 ], requireActiveUser);
 
-app.post("/oauth/xero/start-token", requireActiveUser, async (request, response) => {
+app.post("/oauth/xero/start-token", requireActiveUserOrLegacyXeroAccount, async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId || request.query?.accountId);
         if (!accountId) {
@@ -1203,7 +1278,7 @@ for (const reportPath of ["/problem-report", "/jentry/problem-report"]) {
     );
 }
 
-app.post("/jentry/inbox/register", async (request, response) => {
+const inboxRegistrationHandler = async (request, response) => {
     try {
         const accountId = normalizeOptionalString(request.body?.accountId);
         const clientId = normalizeOptionalString(request.body?.clientId);
@@ -1254,7 +1329,11 @@ app.post("/jentry/inbox/register", async (request, response) => {
             message: error instanceof Error ? error.message : "Unable to register inbox."
         });
     }
-});
+};
+
+for (const inboxRegistrationPath of ["/jentry/inbox/register", "/inbound-email-addresses/register"]) {
+    app.post(inboxRegistrationPath, inboxRegistrationHandler);
+}
 
 app.get("/inbound-email-submissions", async (request, response) => {
     try {
@@ -2266,7 +2345,7 @@ async function setWorkspaceSuspension({ accountId, isSuspended, reason = null, a
             reason: normalizedReason,
             beforeSummary,
             afterSummary: nextSuspended
-                ? `Suspended${normalizedReason ? ` • ${normalizedReason}` : ""}`
+                ? `Suspended${normalizedReason ? ` Ã¢â‚¬Â¢ ${normalizedReason}` : ""}`
                 : "Active",
             detail: nextSuspended
                 ? `${companyName} was suspended and will be blocked on next access.`
@@ -2353,8 +2432,8 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
             category: "registry",
             actionTitle: "Updated workspace registry",
             targetName,
-            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" • ") || "No registry record",
-            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" • "),
+            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" Ã¢â‚¬Â¢ ") || "No registry record",
+            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" Ã¢â‚¬Â¢ "),
             detail: `${targetName} registry details were updated.`
         }
     });
@@ -3451,7 +3530,7 @@ function buildMatchSummary(candidate, score) {
         `match score ${score}`
     ].filter(Boolean);
 
-    return fragments.join(" • ");
+    return fragments.join(" Ã¢â‚¬Â¢ ");
 }
 
 function normalizeComparableText(value) {
@@ -4214,7 +4293,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern '£11.58 – McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses", 
+                            "The suggested title should be concise and usually follow the pattern 'Ã‚Â£11.58 Ã¢â‚¬â€œ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses",
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
                             codingInstructions.systemInstruction,
                             "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
@@ -5022,7 +5101,7 @@ function inferFallbackTaxTreatment(extraction) {
     const recognizedText = normalizeComparableWords(extraction?.recognizedText || "");
     const vatAmount = typeof extraction?.vatAmount === "number" ? extraction.vatAmount : null;
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat £0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat Ã‚Â£0")) {
         return "No VAT";
     }
 
@@ -5262,7 +5341,7 @@ function normalizeComparableWords(value) {
     return normalizeOptionalString(value)
         .toLowerCase()
         .replace(/&/g, " and ")
-        .replace(/[^a-z0-9£.\s-]/g, " ")
+        .replace(/[^a-z0-9Ã‚Â£.\s-]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -5270,7 +5349,7 @@ function normalizeComparableWords(value) {
 function detectFoodDrinkContext(text) {
     const normalized = normalizeComparableWords(text);
     const keywords = [
-        "restaurant", "cafe", "café", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
+        "restaurant", "cafe", "cafÃƒÂ©", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
         "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
         "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
         "goujons", "greggs", "mcdonald", "mcdonalds", "costa", "starbucks", "pret",
@@ -5400,7 +5479,7 @@ function chooseTaxTreatment({
         return { taxType: existing, taxTreatment: existing };
     }
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat £0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat Ã‚Â£0")) {
         return { taxType: "No VAT", taxTreatment: "No VAT" };
     }
 
