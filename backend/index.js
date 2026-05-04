@@ -3083,6 +3083,18 @@ function xeroConfigured() {
     return Boolean(xeroClientID() && xeroClientSecret() && xeroRedirectURI());
 }
 
+function hasXeroScope(connection, requiredScope) {
+    const normalizedScope = normalizeOptionalString(requiredScope);
+    if (!normalizedScope) return true;
+
+    const grantedScopes = String(connection?.scope || "")
+        .split(/\s+/)
+        .map((scope) => normalizeOptionalString(scope))
+        .filter(Boolean);
+
+    return grantedScopes.includes(normalizedScope);
+}
+
 function toBase64Url(value) {
     const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
 
@@ -4012,6 +4024,17 @@ async function attachDocumentsToXeroTransaction({
     const connection = await ensureFreshXeroConnection(normalizedAccountId);
     if (!connection.selectedTenantId) {
         throw new XeroAPIError({ message: "No Xero organisation has been selected for this account.", code: "XERO_TENANT_NOT_SELECTED", status: 403, requiresReconnect: false });
+    }
+    if (!hasXeroScope(connection, "accounting.attachments")) {
+        throw new XeroAPIError({
+            message: "Reconnect Xero to grant attachment access. The current Xero connection does not include the accounting.attachments scope.",
+            code: "XERO_ATTACHMENTS_SCOPE_REQUIRED",
+            status: 401,
+            requiresReconnect: true,
+            upstreamBody: {
+                missingScope: "accounting.attachments"
+            }
+        });
     }
 
     const attachedFiles = [];
@@ -5680,5 +5703,3 @@ async function buildRawMessage({ from, to, subject, body, attachments }) {
         .replace(/\//g, "_")
         .replace(/=+$/g, "");
 }
-
-
