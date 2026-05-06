@@ -29,7 +29,11 @@ const optionalEnvironmentVariables = {
     openAIAPIKey: process.env.OPENAI_API_KEY?.trim() || "",
     openAIModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini"
 };
-const JENTRY_CONTROL_PANEL_API_TOKEN = process.env.JENTRY_CONTROL_PANEL_API_TOKEN?.trim() || "";
+const JENTRY_CONTROL_PANEL_API_TOKEN =
+    process.env.JENTRY_CONTROL_PANEL_API_TOKEN?.trim()
+    || process.env.JENTRY_BACKEND_BEARER_TOKEN?.trim()
+    || process.env.JENTRY_API_BEARER_TOKEN?.trim()
+    || "";
 
 const SERVER_SUPER_ADMIN_EMAILS = new Set(
     (process.env.SERVER_SUPER_ADMIN_EMAILS || "")
@@ -240,7 +244,7 @@ const SUSPENDED_ACCOUNT_ERROR = {
 
 const PAID_SUBSCRIPTION_REQUIRED_ERROR = {
     code: "PAID_SUBSCRIPTION_REQUIRED",
-    message: `We understand that you're not a Jaccountancy client. Jentry is free only for Jaccountancy clients. To continue using the software, start the £${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP} per month subscription.`
+    message: `We understand that you're not a Jaccountancy client. Jentry is free only for Jaccountancy clients. To continue using the software, start the Â£${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP} per month subscription.`
 };
 
 function sendSuspendedResponse(response) {
@@ -2170,6 +2174,110 @@ app.get("/api/v1/dashboard", requireAdminUserOrControlPanelToken, async (_reques
     }
 });
 
+app.post("/api/v1/workspaces", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+
+        const companyName = normalizeOptionalString(
+            request.body?.companyName ||
+            request.body?.company_name ||
+            request.body?.clientName ||
+            request.body?.client_name ||
+            request.body?.name
+        );
+        const contactName = normalizeOptionalString(
+            request.body?.contactName ||
+            request.body?.contact_name ||
+            request.body?.primaryContactName ||
+            request.body?.primary_contact_name
+        );
+        const contactEmail = normalizeEmail(
+            request.body?.contactEmail ||
+            request.body?.contact_email ||
+            request.body?.primaryContactEmail ||
+            request.body?.primary_contact_email ||
+            request.body?.email
+        );
+        const companyNumber = normalizeOptionalString(
+            request.body?.companyNumber ||
+            request.body?.company_number
+        ) || null;
+
+        if (!companyName || !contactName || !contactEmail) {
+            response.status(400).json({
+                message: "companyName, contactName and contactEmail are required."
+            });
+            return;
+        }
+
+        const assignedUser = await getOrCreateUserFromEmail({
+            email: contactEmail,
+            displayName: contactName,
+            loginEvent: false
+        });
+
+        const accountId = crypto.randomUUID();
+        const generatedInboxEmail = await createGeneratedInboxEmail(companyName);
+        const inboxEmail = normalizeEmail(
+            request.body?.jentryInboundEmail ||
+            request.body?.jentry_inbound_email ||
+            request.body?.inboxEmail ||
+            request.body?.inboundEmail
+        ) || generatedInboxEmail;
+
+        await upsertAccountRecord({
+            accountId,
+            companyName,
+            clientId: companyNumber,
+            assignedUserId: assignedUser?.id || null,
+            clientEmail: contactEmail
+        });
+
+        if (assignedUser?.id) {
+            await pool.query(
+                `INSERT INTO memberships (user_id, account_id, role) VALUES ($1, $2, 'owner') ON CONFLICT (user_id, account_id) DO NOTHING`,
+                [assignedUser.id, accountId]
+            );
+        }
+
+        await upsertJentryInboxRecord({
+            accountId,
+            inboxEmail,
+            assignedUserEmail: contactEmail,
+            assignedUserId: assignedUser?.id || null,
+            updatedBy: request.superAdminEmail || request.authenticatedUser?.email || "control-panel-token@jentry.local",
+            isActive: true
+        });
+
+        await writeAdminAuditLog(request, {
+            action: "workspace.created",
+            targetType: "workspace",
+            targetId: accountId,
+            details: {
+                category: "clients",
+                actionTitle: "Created workspace",
+                targetName: companyName,
+                detail: `${companyName} was created from the compatibility control panel flow.`,
+                afterSummary: `${contactEmail} â€¢ ${inboxEmail}`
+            }
+        });
+
+        response.status(201).json({
+            id: accountId,
+            companyName,
+            jentryInboundEmail: inboxEmail,
+            xeroTenantID: null,
+            xeroConnectionStatus: "disconnected",
+            contactName,
+            contactEmail,
+            companyNumber,
+            createdAt: new Date().toISOString()
+        });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to create workspace." });
+    }
+});
+
 app.post("/api/v1/submissions/:submissionId/retry", requireAdminUserOrControlPanelToken, async (request, response) => {
     try {
         await ensureProcessedInboundSubmissionsTable();
@@ -2893,6 +3001,30 @@ async function upsertJentryInboxRecord({ accountId, inboxEmail, assignedUserEmai
     return mapInboxRow(result.rows[0]);
 }
 
+async function createGeneratedInboxEmail(companyName) {
+    const base = normalizeOptionalString(companyName)
+        .toLowerCase()
+        .replace(/\b(ltd|limited)\b/g, "")
+        .replace(/[^a-z0-9]+/g, "")
+        .trim() || "workspace";
+
+    let candidate = base;
+    let suffix = 2;
+
+    while (true) {
+        const inboxEmail = `${candidate}@inbound.jentry.co.uk`;
+        const existing = await pool.query(
+            `SELECT 1 FROM jentry_inboxes WHERE LOWER(inbox_email) = LOWER($1) LIMIT 1`,
+            [inboxEmail]
+        );
+        if (!existing.rows[0]) {
+            return inboxEmail;
+        }
+        candidate = `${base}${suffix}`;
+        suffix += 1;
+    }
+}
+
 async function updatePresence({ userId, accountId = null, connectedUserEmail = null } = {}) {
     await ensureCoreModelTables();
     if (userId) {
@@ -3149,7 +3281,7 @@ async function setWorkspaceSuspension({ accountId, isSuspended, reason = null, a
             reason: normalizedReason,
             beforeSummary,
             afterSummary: nextSuspended
-                ? `Suspended${normalizedReason ? ` â€¢ ${normalizedReason}` : ""}`
+                ? `Suspended${normalizedReason ? ` Ã¢â‚¬Â¢ ${normalizedReason}` : ""}`
                 : "Active",
             detail: nextSuspended
                 ? `${companyName} was suspended and will be blocked on next access.`
@@ -3205,11 +3337,11 @@ async function updateWorkspaceBilling({ accountId, billingMode, actorEmail, requ
             category: "billing",
             actionTitle: nextBillingMode === "free" ? "Made account free" : "Made account paid",
             targetName: beforeRow.company_name || normalizedAccountId,
-            beforeSummary: `${beforeRow.billing_mode || "free"} • ${beforeRow.subscription_status || "free"}`,
-            afterSummary: `${nextBillingMode} • ${nextSubscriptionStatus}`,
+            beforeSummary: `${beforeRow.billing_mode || "free"} â€¢ ${beforeRow.subscription_status || "free"}`,
+            afterSummary: `${nextBillingMode} â€¢ ${nextSubscriptionStatus}`,
             detail: nextBillingMode === "free"
                 ? `${beforeRow.company_name || normalizedAccountId} now uses the free Jaccountancy plan.`
-                : `${beforeRow.company_name || normalizedAccountId} now requires the £${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP}/month paid plan.`
+                : `${beforeRow.company_name || normalizedAccountId} now requires the Â£${JENTRY_PAID_SUBSCRIPTION_AMOUNT_GBP}/month paid plan.`
         }
     });
 }
@@ -3292,8 +3424,8 @@ async function updateWorkspaceRegistry({ accountId, displayName, assignedUserEma
             category: "registry",
             actionTitle: "Updated workspace registry",
             targetName,
-            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" â€¢ ") || "No registry record",
-            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" â€¢ "),
+            beforeSummary: [beforeRow?.company_name, beforeRow?.assigned_user_email, beforeRow?.inbox_email].filter(Boolean).join(" Ã¢â‚¬Â¢ ") || "No registry record",
+            afterSummary: [normalizedDisplayName || updated?.companyName, normalizedAssignedUserEmail, normalizedInboxEmail].filter(Boolean).join(" Ã¢â‚¬Â¢ "),
             detail: `${targetName} registry details were updated.`
         }
     });
@@ -3399,7 +3531,7 @@ async function deleteWorkspace({ accountId, actorEmail, request } = {}) {
             category: "clients",
             actionTitle: "Deleted workspace",
             targetName,
-            beforeSummary: [beforeRow.company_name, beforeRow.client_email, beforeRow.client_id].filter(Boolean).join(" • ") || normalizedAccountId,
+            beforeSummary: [beforeRow.company_name, beforeRow.client_email, beforeRow.client_id].filter(Boolean).join(" â€¢ ") || normalizedAccountId,
             afterSummary: "Deleted",
             detail: `${targetName} and its linked submitted data were deleted from the live admin console.`
         }
@@ -3455,7 +3587,22 @@ async function buildCompatibilityDashboardPayload() {
             xeroTenantID: primaryWorkspace.xeroOrganisationID || null,
             xeroConnectionStatus: connectedCount > 0 ? "connected" : "disconnected"
         },
-        submissions: submissionsResult.rows.map(mapCompatibilitySubmissionRow)
+        submissions: submissionsResult.rows.map(mapCompatibilitySubmissionRow),
+        clients: workspaceRows.map(mapCompatibilityClientWorkspaceRow)
+    };
+}
+
+function mapCompatibilityClientWorkspaceRow(row) {
+    return {
+        id: row.accountID,
+        companyName: row.companyName || row.accountID,
+        jentryInboundEmail: row.jentryInboxEmail || "",
+        xeroTenantID: row.xeroOrganisationID || null,
+        xeroConnectionStatus: row.isConnectedToXero && !row.requiresReconnect ? "connected" : "disconnected",
+        contactName: row.assignedUserEmail || null,
+        contactEmail: row.assignedUserEmail || null,
+        companyNumber: row.clientID || null,
+        createdAt: row.lastSubmissionAt || row.lastSeenAt || new Date().toISOString()
     };
 }
 
@@ -4873,7 +5020,7 @@ function buildMatchSummary(candidate, score) {
         `match score ${score}`
     ].filter(Boolean);
 
-    return fragments.join(" â€¢ ");
+    return fragments.join(" Ã¢â‚¬Â¢ ");
 }
 
 function normalizeComparableText(value) {
@@ -5654,7 +5801,7 @@ async function analyzeReceiptWithOpenAI({ buffer, mimeType, capturedAt, analysis
                             "If a field is unclear, leave it null and set needsReview to true.",
                             "Produce a short summary in plain English such as 'Food and drink receipt for Via'.",
                             "Also return dedicated title fields for vendor and final amount. These title fields must be the best normalized vendor name and final paid total for naming the document.",
-                            "The suggested title should be concise and usually follow the pattern 'Â£11.58 â€“ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses",
+                            "The suggested title should be concise and usually follow the pattern 'Ã‚Â£11.58 Ã¢â‚¬â€œ McDonald's'. Do not use store numbers, cashier names, phone numbers, dates, or addresses",
                             "Also produce a longer helpful description for the detail screen, covering what the document appears to be, the merchant, the total, the date, and any notable payment",
                             codingInstructions.systemInstruction,
                             "Apply accounting judgement, not just literal item matching. Never classify food, drink, restaurants, cafes, takeaways, pubs, bars, or refreshments as Cost of Goods Sold unless the business context clearly shows the items were bought for resale or the client is a food/drink trading business. For ordinary service businesses, low-value food and drink receipts are usually subsistence, travel, staff welfare, refreshments, or entertainment depending on context. If friends, social dining, alcohol, guests, unclear attendees, or unclear business purpose are present, set needsReview true and cap coding confidence below 0.55.",
@@ -6462,7 +6609,7 @@ function inferFallbackTaxTreatment(extraction) {
     const recognizedText = normalizeComparableWords(extraction?.recognizedText || "");
     const vatAmount = typeof extraction?.vatAmount === "number" ? extraction.vatAmount : null;
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat Â£0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("total vat 0") || recognizedText.includes("total vat Ã‚Â£0")) {
         return "No VAT";
     }
 
@@ -6702,7 +6849,7 @@ function normalizeComparableWords(value) {
     return normalizeOptionalString(value)
         .toLowerCase()
         .replace(/&/g, " and ")
-        .replace(/[^a-z0-9Â£.\s-]/g, " ")
+        .replace(/[^a-z0-9Ã‚Â£.\s-]/g, " ")
         .replace(/\s+/g, " ")
         .trim();
 }
@@ -6710,7 +6857,7 @@ function normalizeComparableWords(value) {
 function detectFoodDrinkContext(text) {
     const normalized = normalizeComparableWords(text);
     const keywords = [
-        "restaurant", "cafe", "cafÃ©", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
+        "restaurant", "cafe", "cafÃƒÂ©", "coffee", "tea", "takeaway", "deliveroo", "ubereats",
         "just eat", "bar", "pub", "bistro", "grill", "kitchen", "food", "drink", "meal",
         "breakfast", "lunch", "dinner", "sandwich", "burger", "pizza", "chicken", "goujon",
         "goujons", "greggs", "mcdonald", "mcdonalds", "costa", "starbucks", "pret",
@@ -6840,7 +6987,7 @@ function chooseTaxTreatment({
         return { taxType: existing, taxTreatment: existing };
     }
 
-    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat Â£0")) {
+    if (vatAmount === 0 || recognizedText.includes("no vat") || recognizedText.includes("vat 0") || recognizedText.includes("total vat Ã‚Â£0")) {
         return { taxType: "No VAT", taxTreatment: "No VAT" };
     }
 
