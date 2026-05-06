@@ -1,0 +1,1380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Jentry Portal</title>
+    <style>
+        :root {
+          --ink: #0f2742;
+          --muted: #6b7c93;
+          --line: #d6e2ef;
+          --surface: #f4f8fc;
+          --card: #ffffff;
+          --primary: #0a66c2;
+          --primary-deep: #0b4474;
+          --primary-soft: #e9f4ff;
+          --success: #14804a;
+          --success-soft: #dcfce7;
+          --warning: #a16207;
+          --warning-soft: #fef3c7;
+          --danger: #b42318;
+          --danger-soft: #fee4ei hav2;
+          --shadow: 0 24px 70px rgba(12, 54, 93, 0.12);
+        }
+
+        .entry-header,
+        .page-title,
+        .wp-block-post-title,
+        h1.entry-title {
+          display: none !important;
+        }
+
+        .entry-content,
+        .wp-block-post-content {
+          max-width: none !important;
+          width: 100% !important;
+          padding: 0 !important;
+          margin: 0 !important;
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        body {
+          margin: 0;
+          font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+          color: var(--ink);
+          background:
+            radial-gradient(circle at top left, rgba(58, 141, 222, 0.18), transparent 28%),
+            linear-gradient(180deg, #eff6fc 0%, #e8f1fa 100%);
+        }
+
+        button,
+        input,
+        select {
+          font: inherit;
+        }
+
+        .jentry-shell {
+          min-height: 100vh;
+          padding: 28px;
+        }
+
+        .jentry-frame {
+          max-width: 1520px;
+          margin: 0 auto;
+          border: 1px solid rgba(214, 226, 239, 0.92);
+          border-radius: 28px;
+          overflow: hidden;
+          background: rgba(255, 255, 255, 0.92);
+          box-shadow: var(--shadow);
+          backdrop-filter: blur(10px);
+        }
+
+        .jentry-topbar {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          padding: 18px 24px;
+          color: #fff;
+          background: linear-gradient(120deg, #0a66c2, #0b4474 72%);
+        }
+
+        .jentry-brand {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          min-width: 240px;
+        }
+
+        .jentry-mark {
+          width: 44px;
+          height: 44px;
+          border-radius: 16px;
+          display: grid;
+          place-items: center;
+          font-weight: 800;
+          background: rgba(255, 255, 255, 0.16);
+        }
+
+        .jentry-brand h1 {
+          margin: 0;
+          font-size: 18px;
+          line-height: 1.2;
+        }
+
+        .jentry-brand p {
+          margin: 2px 0 0;
+          font-size: 12px;
+          color: rgba(255, 255, 255, 0.78);
+        }
+
+        .jentry-topbar-actions {
+          margin-left: auto;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+
+        .jentry-btn,
+        .jentry-ghost,
+        .jentry-inline-btn {
+          border: 0;
+          border-radius: 12px;
+          padding: 11px 15px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+        }
+
+        .jentry-btn:hover,
+        .jentry-ghost:hover,
+        .jentry-inline-btn:hover {
+          transform: translateY(-1px);
+        }
+
+        .jentry-btn {
+          color: #fff;
+          background: linear-gradient(135deg, #0a66c2, #2491ff);
+          box-shadow: 0 12px 24px rgba(10, 102, 194, 0.28);
+        }
+
+        .jentry-ghost {
+          color: #fff;
+          background: rgba(255, 255, 255, 0.13);
+        }
+
+        .jentry-inline-btn {
+          color: var(--primary-deep);
+          background: #fff;
+          border: 1px solid var(--line);
+          padding: 9px 12px;
+        }
+
+        .jentry-inline-btn.active {
+          color: #fff;
+          background: linear-gradient(135deg, #0a66c2, #2491ff);
+          border-color: transparent;
+        }
+
+        .jentry-content {
+          padding: 28px;
+        }
+
+        .jentry-view {
+          display: none;
+        }
+
+        .jentry-view.active {
+          display: block;
+        }
+
+        .jentry-hero {
+          display: flex;
+          gap: 20px;
+          justify-content: space-between;
+          padding: 26px 28px;
+          margin-bottom: 20px;
+          border: 1px solid var(--line);
+          border-radius: 24px;
+          background:
+            linear-gradient(135deg, rgba(233, 244, 255, 0.95), rgba(255, 255, 255, 0.96)),
+            #fff;
+        }
+
+        .jentry-kicker {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 7px 12px;
+          border-radius: 999px;
+          background: var(--primary-soft);
+          color: var(--primary-deep);
+          font-size: 12px;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+
+        .jentry-hero h2 {
+          margin: 14px 0 10px;
+          font-size: 36px;
+          line-height: 1.08;
+        }
+
+        .jentry-hero p {
+          max-width: 840px;
+          margin: 0;
+          color: var(--muted);
+          line-height: 1.6;
+        }
+
+        .jentry-hero-stats {
+          min-width: 320px;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+        }
+
+        .jentry-stat {
+          padding: 18px;
+          border-radius: 18px;
+          background: #fff;
+          border: 1px solid var(--line);
+        }
+
+        .jentry-stat span {
+          display: block;
+          font-size: 11px;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          color: var(--muted);
+          font-weight: 700;
+        }
+
+        .jentry-stat strong {
+          display: block;
+          margin-top: 8px;
+          font-size: 28px;
+          color: var(--primary-deep);
+        }
+
+        .jentry-card {
+          margin-bottom: 20px;
+          border: 1px solid var(--line);
+          border-radius: 24px;
+          background: var(--card);
+          overflow: hidden;
+        }
+
+        .jentry-card-head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          padding: 20px 24px;
+          border-bottom: 1px solid var(--line);
+          background: linear-gradient(180deg, #fbfdff 0%, #f5f9fd 100%);
+        }
+
+        .jentry-card-head h3,
+        .jentry-panel h3 {
+          margin: 0;
+          font-size: 22px;
+        }
+
+        .jentry-card-head p,
+        .jentry-panel p,
+        .jentry-label {
+          margin: 6px 0 0;
+          color: var(--muted);
+          font-size: 13px;
+        }
+
+        .jentry-searchbar,
+        .jentry-toolbar {
+          display: grid;
+          gap: 12px;
+          padding: 18px 24px;
+          border-bottom: 1px solid var(--line);
+          background: #f9fbfe;
+        }
+
+        .jentry-searchbar {
+          grid-template-columns: minmax(260px, 1.5fr) 180px 180px auto;
+        }
+
+        .jentry-toolbar {
+          grid-template-columns: minmax(260px, 1.4fr) 180px 180px 180px auto;
+        }
+
+        .jentry-input,
+        .jentry-select {
+          width: 100%;
+          padding: 12px 14px;
+          border: 1px solid var(--line);
+          border-radius: 14px;
+          background: #fff;
+          color: var(--ink);
+        }
+
+        .jentry-grid {
+          display: grid;
+          gap: 20px;
+          grid-template-columns: minmax(0, 1.7fr) minmax(340px, 0.9fr);
+          align-items: start;
+        }
+
+        .jentry-client-list {
+          display: grid;
+          gap: 16px;
+          padding: 22px;
+          grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        }
+
+        .jentry-client-card {
+          padding: 22px;
+          border: 1px solid var(--line);
+          border-radius: 20px;
+          background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+          box-shadow: 0 14px 34px rgba(11, 68, 116, 0.06);
+        }
+
+        .jentry-client-card h4,
+        .jentry-document-title {
+          margin: 0;
+          font-size: 20px;
+        }
+
+        .jentry-client-card p {
+          margin: 8px 0 0;
+          color: var(--muted);
+          line-height: 1.5;
+        }
+
+        .jentry-chip-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
+          margin-top: 16px;
+        }
+
+        .jentry-chip,
+        .jentry-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 7px 11px;
+          border-radius: 999px;
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .jentry-chip {
+          background: #eef4f9;
+          color: var(--primary-deep);
+        }
+
+        .jentry-badge.green { background: var(--success-soft); color: var(--success); }
+        .jentry-badge.amber { background: var(--warning-soft); color: var(--warning); }
+        .jentry-badge.red { background: var(--danger-soft); color: var(--danger); }
+        .jentry-badge.blue { background: var(--primary-soft); color: var(--primary); }
+        .jentry-badge.grey { background: #eef2f6; color: #516274; }
+
+        .jentry-client-actions {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 12px;
+          margin-top: 18px;
+        }
+
+        .jentry-client-actions strong {
+          font-size: 12px;
+          color: var(--muted);
+        }
+
+        .jentry-workspace-shell {
+          display: grid;
+          gap: 20px;
+        }
+
+        .jentry-workspace-top {
+          display: flex;
+          justify-content: space-between;
+          gap: 16px;
+          align-items: flex-start;
+          padding: 22px 24px;
+          border: 1px solid var(--line);
+          border-radius: 24px;
+          background: linear-gradient(135deg, #0f2742, #0f4776 80%);
+          color: #fff;
+        }
+
+        .jentry-breadcrumbs {
+          display: flex;
+          gap: 10px;
+          align-items: center;
+          margin-bottom: 12px;
+          color: rgba(255, 255, 255, 0.82);
+          font-size: 12px;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+
+        .jentry-workspace-top h2 {
+          margin: 0;
+          font-size: 34px;
+          line-height: 1.06;
+        }
+
+        .jentry-workspace-top p {
+          margin: 10px 0 0;
+          max-width: 760px;
+          color: rgba(255, 255, 255, 0.78);
+          line-height: 1.6;
+        }
+
+        .jentry-summary {
+          min-width: 320px;
+          display: grid;
+          gap: 12px;
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .jentry-summary-card {
+          padding: 16px 18px;
+          border-radius: 18px;
+          background: rgba(255, 255, 255, 0.1);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+        }
+
+        .jentry-summary-card span {
+          display: block;
+          font-size: 11px;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: rgba(255, 255, 255, 0.68);
+        }
+
+        .jentry-summary-card strong {
+          display: block;
+          margin-top: 8px;
+          font-size: 26px;
+        }
+
+        .jentry-table-wrap {
+          overflow-x: auto;
+        }
+
+        .jentry-table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .jentry-table th {
+          padding: 14px 16px;
+          text-align: left;
+          font-size: 11px;
+          letter-spacing: 0.06em;
+          text-transform: uppercase;
+          color: var(--muted);
+          background: #f5f8fc;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .jentry-table td {
+          padding: 15px 16px;
+          border-bottom: 1px solid #ecf2f8;
+          vertical-align: middle;
+          font-size: 13px;
+        }
+
+        .jentry-table tbody tr {
+          cursor: pointer;
+        }
+
+        .jentry-table tbody tr:hover td {
+          background: #f9fbfe;
+        }
+
+        .jentry-table tbody tr.active td {
+          background: #eef6ff;
+        }
+
+        .jentry-subtitle {
+          display: block;
+          margin-top: 4px;
+          color: var(--muted);
+          font-size: 12px;
+        }
+
+        .jentry-cell-title {
+          font-weight: 800;
+          color: var(--ink);
+        }
+
+        .jentry-row-actions {
+          display: flex;
+          gap: 8px;
+          align-items: center;
+          flex-wrap: wrap;
+        }
+
+        .jentry-screen-switcher {
+          display: inline-flex;
+          gap: 8px;
+          padding: 6px;
+          border-radius: 16px;
+          background: #edf4fb;
+          border: 1px solid var(--line);
+        }
+
+        .jentry-row-publish {
+          min-width: 110px;
+          text-align: center;
+        }
+
+        .jentry-panel {
+          padding: 22px;
+          border: 1px solid var(--line);
+          border-radius: 24px;
+          background: #fff;
+        }
+
+        .jentry-panel + .jentry-panel {
+          margin-top: 20px;
+        }
+
+        .jentry-detail-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 12px;
+          margin-top: 18px;
+        }
+
+        .jentry-detail-item {
+          padding: 14px;
+          border-radius: 16px;
+          background: #f8fbfe;
+          border: 1px solid var(--line);
+        }
+
+        .jentry-detail-item span {
+          display: block;
+          margin-bottom: 8px;
+          font-size: 11px;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          color: var(--muted);
+        }
+
+        .jentry-detail-item strong,
+        .jentry-detail-item div {
+          font-size: 14px;
+          line-height: 1.4;
+        }
+
+        .jentry-note {
+          margin-top: 18px;
+          padding: 16px;
+          border-radius: 16px;
+          background: #f8fbfe;
+          border: 1px solid var(--line);
+          color: var(--muted);
+          line-height: 1.55;
+        }
+
+        .jentry-nominal-cell {
+          display: grid;
+          gap: 8px;
+        }
+
+        .jentry-auto-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          width: fit-content;
+          padding: 5px 9px;
+          border-radius: 999px;
+          background: #eef6ff;
+          color: var(--primary-deep);
+          font-size: 11px;
+          font-weight: 800;
+          cursor: help;
+        }
+
+        .jentry-auto-pill strong {
+          font-size: 12px;
+          line-height: 1;
+        }
+
+        .jentry-upload-dropzone {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          padding: 18px 20px;
+          border: 1px dashed #9fc5ea;
+          border-radius: 18px;
+          background: linear-gradient(180deg, #f7fbff 0%, #eef6ff 100%);
+        }
+
+        .jentry-upload-dropzone strong {
+          display: block;
+          font-size: 15px;
+        }
+
+        .jentry-upload-dropzone p {
+          margin: 6px 0 0;
+          color: var(--muted);
+          font-size: 13px;
+          line-height: 1.5;
+        }
+
+        .jentry-empty {
+          padding: 48px 24px;
+          text-align: center;
+          color: var(--muted);
+        }
+
+        .jentry-modal {
+          display: none;
+          position: fixed;
+          inset: 0;
+          z-index: 99999;
+          padding: 24px;
+          align-items: center;
+          justify-content: center;
+          background: rgba(12, 39, 66, 0.4);
+          backdrop-filter: blur(4px);
+        }
+
+        .jentry-modal.active {
+          display: flex;
+        }
+
+        .jentry-modal-box {
+          width: min(100%, 480px);
+          padding: 24px;
+          border-radius: 24px;
+          background: #fff;
+          box-shadow: 0 32px 96px rgba(0, 0, 0, 0.24);
+        }
+
+        .jentry-modal-box h3 {
+          margin: 0;
+          font-size: 28px;
+        }
+
+        .jentry-modal-box p {
+          margin: 12px 0 18px;
+          color: var(--muted);
+          line-height: 1.6;
+        }
+
+        .jentry-modal-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+        }
+
+        @media (max-width: 1180px) {
+          .jentry-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .jentry-workspace-top,
+          .jentry-hero {
+            flex-direction: column;
+          }
+
+          .jentry-summary,
+          .jentry-hero-stats {
+            width: 100%;
+          }
+        }
+
+        @media (max-width: 860px) {
+          .jentry-shell,
+          .jentry-content {
+            padding: 18px;
+          }
+
+          .jentry-searchbar,
+          .jentry-toolbar {
+            grid-template-columns: 1fr;
+          }
+
+          .jentry-summary,
+          .jentry-detail-grid,
+          .jentry-hero-stats {
+            grid-template-columns: 1fr;
+          }
+
+          .jentry-topbar {
+            align-items: flex-start;
+          }
+
+          .jentry-topbar-actions {
+            margin-left: 0;
+          }
+        }
+    </style>
+</head>
+<body>
+    <div class="jentry-shell">
+      <div class="jentry-frame">
+        <div class="jentry-topbar">
+          <div class="jentry-brand">
+            <div class="jentry-mark">J</div>
+            <div>
+              <h1>Jentry Property Document Desk</h1>
+              <p>Client search, document coding and publish control</p>
+            </div>
+          </div>
+
+          <div class="jentry-topbar-actions">
+            <button class="jentry-ghost" onclick="showDirectory()">Clients</button>
+            <button class="jentry-ghost" onclick="exportAllDocuments()">Export All</button>
+            <button class="jentry-ghost" onclick="requestRefresh()">Refresh</button>
+            <a class="jentry-ghost" style="text-decoration:none;" href="https://team.jaccountancy.co.uk">Back to Hub</a>
+          </div>
+        </div>
+
+        <div class="jentry-content">
+          <section id="directoryView" class="jentry-view active">
+            <div class="jentry-hero">
+              <div>
+                <div class="jentry-kicker">Property workflow reset</div>
+                <h2>Find a client, open the document queue, publish with confidence.</h2>
+                <p>The hub now starts with the client list. Search for the property client you need, open their workspace, review each incoming document, pick the right nominal code and publish it when ready.</p>
+              </div>
+
+              <div class="jentry-hero-stats" id="directoryStats"></div>
+            </div>
+
+            <div class="jentry-card">
+              <div class="jentry-card-head">
+                <div>
+                  <h3>Client Directory</h3>
+                  <p id="directorySubtitle">Live workspaces currently available in Jentry.</p>
+                </div>
+              </div>
+
+              <div class="jentry-searchbar">
+                <input id="clientSearchInput" class="jentry-input" placeholder="Search by client, inbound email or supplier..." oninput="renderDirectory()">
+                <select id="clientStatusFilter" class="jentry-select" onchange="renderDirectory()">
+                  <option value="all">All statuses</option>
+                  <option value="Active">Active</option>
+                  <option value="Attention">Attention</option>
+                </select>
+                <select id="clientSortFilter" class="jentry-select" onchange="renderDirectory()">
+                  <option value="activity">Recent activity</option>
+                  <option value="name">Client name</option>
+                  <option value="ready">Ready to publish</option>
+                </select>
+                <button class="jentry-inline-btn" onclick="resetClientFilters()">Clear</button>
+              </div>
+
+              <div id="clientDirectory" class="jentry-client-list"></div>
+            </div>
+          </section>
+
+          <section id="workspaceView" class="jentry-view">
+            <div class="jentry-workspace-shell">
+              <div class="jentry-workspace-top">
+                <div>
+                  <div class="jentry-breadcrumbs">
+                    <span>Clients</span>
+                    <span>/</span>
+                    <span id="workspaceBreadcrumb">Workspace</span>
+                  </div>
+                  <h2 id="workspaceTitle">Client Workspace</h2>
+                  <p id="workspaceSummary">Review every property document in one place, assign the correct nominal code and publish out to Xero when the document is ready.</p>
+                </div>
+
+                <div class="jentry-summary" id="workspaceStats"></div>
+              </div>
+
+              <div class="jentry-grid">
+                <div class="jentry-card">
+                  <div class="jentry-card-head">
+                    <div>
+                      <h3>Document Register</h3>
+                      <p id="workspaceDocumentSubtitle">Every row represents one document awaiting review or publish.</p>
+                    </div>
+                    <div class="jentry-row-actions">
+                      <div class="jentry-screen-switcher" id="workspaceScreenSwitcher"></div>
+                      <button class="jentry-inline-btn" onclick="showDirectory()">Back to Clients</button>
+                      <button class="jentry-inline-btn" onclick="exportCurrentClient()">Export CSV</button>
+                      <button class="jentry-btn" onclick="requestRefresh()">Refresh queue</button>
+                    </div>
+                  </div>
+
+                  <div class="jentry-searchbar" style="grid-template-columns: minmax(240px, 1.2fr) minmax(260px, 1fr) auto;">
+                    <div>
+                      <div class="jentry-label">Submission inbox</div>
+                      <div class="jentry-chip-row" style="margin-top:10px;">
+                        <span class="jentry-chip" id="workspaceInboxEmail">Loading inbox</span>
+                      </div>
+                    </div>
+                    <div class="jentry-upload-dropzone" ondragover="handleUploadDrag(event)" ondrop="handleUploadDrop(event)">
+                      <div>
+                        <strong>Upload into this client workspace</strong>
+                        <p>Drag a PDF or image here, or browse to add a document when it arrives outside the Jentry app flow.</p>
+                      </div>
+                    </div>
+                    <div class="jentry-row-actions" style="justify-content:flex-end; align-items:flex-end;">
+                      <button class="jentry-btn" onclick="requestUpload()">Upload Document</button>
+                    </div>
+                  </div>
+
+                  <div class="jentry-toolbar">
+                    <input id="documentSearchInput" class="jentry-input" placeholder="Search document, supplier or sender..." oninput="renderWorkspace()">
+                    <select id="documentStatusFilter" class="jentry-select" onchange="renderWorkspace()">
+                      <option value="all">All workflow states</option>
+                      <option value="Review">Review</option>
+                      <option value="Ready">Ready</option>
+                      <option value="Published">Published</option>
+                      <option value="Blocked">Blocked</option>
+                      <option value="Draft">Draft</option>
+                    </select>
+                    <select id="documentSourceFilter" class="jentry-select" onchange="renderWorkspace()">
+                      <option value="all">All sources</option>
+                      <option value="Inbound Email">Inbound Email</option>
+                      <option value="App Upload">App Upload</option>
+                    </select>
+                    <select id="documentSortFilter" class="jentry-select" onchange="renderWorkspace()">
+                      <option value="newest">Newest first</option>
+                      <option value="supplier">Supplier</option>
+                      <option value="amount">Highest value</option>
+                    </select>
+                    <button class="jentry-inline-btn" onclick="resetWorkspaceFilters()">Clear</button>
+                  </div>
+
+                  <div class="jentry-table-wrap">
+                    <table class="jentry-table">
+                      <thead>
+                        <tr>
+                          <th>Status</th>
+                          <th>Date</th>
+                          <th>Supplier</th>
+                          <th>Document</th>
+                          <th>Total</th>
+                          <th>Tax rate</th>
+                          <th>Nominal code</th>
+                          <th>Match</th>
+                          <th>Publish</th>
+                        </tr>
+                      </thead>
+                      <tbody id="workspaceRows"></tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div>
+                  <div class="jentry-panel">
+                    <h3 id="detailTitle">Document details</h3>
+                    <p id="detailSubtitle">Select a row to inspect the document before you publish it.</p>
+
+                    <div id="detailBody" class="jentry-empty">No document selected.</div>
+                  </div>
+
+                  <div class="jentry-panel">
+                    <h3>Client controls</h3>
+                    <p>Operational details for the current client workspace.</p>
+                    <div class="jentry-detail-grid" id="clientControlGrid"></div>
+                    <div class="jentry-note" id="clientControlNote"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <div id="jentryModal" class="jentry-modal">
+      <div class="jentry-modal-box">
+        <h3>Update</h3>
+        <p id="jentryModalText">Ready.</p>
+        <div class="jentry-modal-actions">
+          <button class="jentry-inline-btn" onclick="closeJentryModal()">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+        const nominalCodeOptions = [
+          "310 - Cost of Goods Sold",
+          "311 - Property Contractors",
+          "318 - Utilities",
+          "330 - Repairs & Maintenance",
+          "400 - Advertising & Marketing",
+          "400 - Travel & Mileage",
+          "610 - Professional Fees",
+          "720 - Office Expenses"
+        ];
+
+        const state = {
+          isLoading: true,
+          errorMessage: null,
+          workspace: null,
+          stats: { totalSubmissions: 0, appUploads: 0, inboundEmails: 0, needsReview: 0 },
+          statuses: [],
+          submissions: [],
+          clients: [],
+          users: [],
+          lastUpdated: "",
+          selectedClientID: null,
+          selectedDocumentID: null,
+          nominalSelections: {},
+          activeWorkspaceScreen: "inbox"
+        };
+
+        function postNative(action, payload = {}) {
+          window.webkit?.messageHandlers?.jentryPortal?.postMessage({ action, ...payload });
+        }
+
+        function requestRefresh() {
+          postNative("refresh");
+        }
+
+        function requestUpload() {
+          postNative("requestUpload");
+          openJentryModal("Choose a PDF or image to upload into this client workspace.");
+        }
+
+        function handleUploadDrag(event) {
+          event.preventDefault();
+        }
+
+        function handleUploadDrop(event) {
+          event.preventDefault();
+          requestUpload();
+        }
+
+        function exportCurrentClient() {
+          const client = selectedClient();
+          if (!client) {
+            openJentryModal("Select a client workspace before exporting.");
+            return;
+          }
+
+          postNative("exportClient", { workspaceID: client.id });
+          openJentryModal(`Preparing a CSV export for ${client.name}.`);
+        }
+
+        function exportAllDocuments() {
+          postNative("exportAll");
+          openJentryModal("Preparing a CSV export for all documents in the control panel.");
+        }
+
+        function statusBadge(value) {
+          const lowerValue = value.toLowerCase();
+          let color = "grey";
+
+          if (["published", "active", "connected", "ready to publish"].includes(lowerValue)) color = "green";
+          if (["review", "ready", "attention", "awaiting review", "needs manual check"].includes(lowerValue)) color = "amber";
+          if (["blocked", "requires retry", "failed"].includes(lowerValue)) color = "red";
+          if (["app upload", "inbound email", "email document", "uploaded document"].includes(lowerValue)) color = "blue";
+
+          return `<span class="jentry-badge ${color}">${value}</span>`;
+        }
+
+        function currencyNumber(value) {
+          if (!value) return 0;
+          const digits = String(value).replace(/[^0-9.-]/g, "");
+          return Number(digits || 0);
+        }
+
+        function normaliseNominalSelections() {
+          state.submissions.forEach(submission => {
+            if (!state.nominalSelections[submission.id]) {
+              state.nominalSelections[submission.id] = submission.nominalCode;
+            }
+          });
+        }
+
+        function documentsForClient(clientID) {
+          return state.submissions.filter(submission => submission.clientID === clientID);
+        }
+
+        function selectedClient() {
+          return state.clients.find(client => client.id === state.selectedClientID) || null;
+        }
+
+        function selectedDocument() {
+          return state.submissions.find(submission => submission.id === state.selectedDocumentID) || null;
+        }
+
+        function showDirectory() {
+          directoryView.classList.add("active");
+          workspaceView.classList.remove("active");
+        }
+
+        function openClientWorkspace(clientID) {
+          state.selectedClientID = clientID;
+          state.activeWorkspaceScreen = "inbox";
+
+          const clientDocuments = documentsForClient(clientID);
+          state.selectedDocumentID = clientDocuments.find(submission => submission.isInbox)?.id || clientDocuments[0]?.id || null;
+
+          renderWorkspace();
+          directoryView.classList.remove("active");
+          workspaceView.classList.add("active");
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        }
+
+        function resetClientFilters() {
+          clientSearchInput.value = "";
+          clientStatusFilter.value = "all";
+          clientSortFilter.value = "activity";
+          renderDirectory();
+        }
+
+        function resetWorkspaceFilters() {
+          documentSearchInput.value = "";
+          documentStatusFilter.value = "all";
+          documentSourceFilter.value = "all";
+          documentSortFilter.value = "newest";
+          renderWorkspace();
+        }
+
+        function setWorkspaceScreen(screen) {
+          state.activeWorkspaceScreen = screen;
+          renderWorkspace();
+        }
+
+        function renderDirectoryStats() {
+          const totalClients = state.clients.length;
+          const readyToPublish = state.clients.reduce((sum, client) => sum + client.readyToPublish, 0);
+          const published = state.clients.reduce((sum, client) => sum + client.published, 0);
+          const review = state.clients.reduce((sum, client) => sum + client.review, 0);
+
+          directoryStats.innerHTML = `
+            <div class="jentry-stat"><span>Clients</span><strong>${totalClients}</strong></div>
+            <div class="jentry-stat"><span>Ready To Publish</span><strong>${readyToPublish}</strong></div>
+            <div class="jentry-stat"><span>Published</span><strong>${published}</strong></div>
+            <div class="jentry-stat"><span>Needs Review</span><strong>${review}</strong></div>
+          `;
+        }
+
+        function renderDirectory() {
+          renderDirectoryStats();
+
+          const query = (clientSearchInput?.value || "").trim().toLowerCase();
+          const status = clientStatusFilter?.value || "all";
+          const sort = clientSortFilter?.value || "activity";
+
+          let clients = [...state.clients].filter(client => {
+            const haystack = `${client.name} ${client.email} ${client.lastSupplier}`.toLowerCase();
+            return (!query || haystack.includes(query)) &&
+                   (status === "all" || client.status === status);
+          });
+
+          if (sort === "name") {
+            clients.sort((left, right) => left.name.localeCompare(right.name));
+          } else if (sort === "ready") {
+            clients.sort((left, right) => right.readyToPublish - left.readyToPublish);
+          } else {
+            clients.sort((left, right) => right.docs - left.docs);
+          }
+
+          directorySubtitle.innerText = `Last sync ${state.lastUpdated || "just now"}. Search by client or supplier and jump straight into their queue.`;
+
+          if (!clients.length) {
+            clientDirectory.innerHTML = `<div class="jentry-empty">No client workspaces match the current filters.</div>`;
+            return;
+          }
+
+          clientDirectory.innerHTML = clients.map(client => `
+            <div class="jentry-client-card">
+              <div class="jentry-row-actions" style="justify-content:space-between;">
+                <div class="jentry-kicker">Client Workspace</div>
+                ${statusBadge(client.status)}
+              </div>
+              <h4>${client.name}</h4>
+              <p>${client.email}</p>
+
+              <div class="jentry-chip-row">
+                <span class="jentry-chip">${client.docs} docs</span>
+                <span class="jentry-chip">${client.inboxCount} inbox</span>
+                <span class="jentry-chip">${client.archiveCount} archive</span>
+                <span class="jentry-chip">${client.readyToPublish} ready</span>
+                <span class="jentry-chip">${client.published} published</span>
+              </div>
+
+              <div class="jentry-note">
+                Last supplier: <strong>${client.lastSupplier}</strong><br>
+                Last activity: ${client.lastActivity}<br>
+                ${client.inboxCount === 0 ? "<strong>Inbox clear:</strong> this client is up to date." : `<strong>Inbox live:</strong> ${client.inboxCount} document(s) still need attention.`}
+              </div>
+
+              <div class="jentry-client-actions">
+                <strong>Open workspace and review document rows</strong>
+                <button class="jentry-btn" onclick="openClientWorkspace('${client.id}')">Open Client</button>
+              </div>
+            </div>
+          `).join("");
+        }
+
+        function filteredDocuments() {
+          const client = selectedClient();
+          if (!client) return [];
+
+          const query = (documentSearchInput?.value || "").trim().toLowerCase();
+          const workflowState = documentStatusFilter?.value || "all";
+          const source = documentSourceFilter?.value || "all";
+          const sort = documentSortFilter?.value || "newest";
+
+          let rows = documentsForClient(client.id).filter(submission => {
+            const haystack = `${submission.doc} ${submission.supplier} ${submission.by} ${submission.email}`.toLowerCase();
+            const screenMatch = state.activeWorkspaceScreen === "archive" ? submission.isArchived : submission.isInbox;
+            return (!query || haystack.includes(query)) &&
+                   screenMatch &&
+                   (workflowState === "all" || submission.publishState === workflowState) &&
+                   (source === "all" || submission.source === source);
+          });
+
+          if (sort === "supplier") {
+            rows.sort((left, right) => left.supplier.localeCompare(right.supplier));
+          } else if (sort === "amount") {
+            rows.sort((left, right) => currencyNumber(right.totalAmount) - currencyNumber(left.totalAmount));
+          } else {
+            rows.sort((left, right) => new Date(right.sortDate) - new Date(left.sortDate));
+          }
+
+          return rows;
+        }
+
+        function selectDocument(documentID) {
+          state.selectedDocumentID = documentID;
+          renderWorkspaceRows();
+          renderDocumentDetail();
+        }
+
+        function onNominalCodeChange(submissionID, value) {
+          state.nominalSelections[submissionID] = value;
+          postNative("updateReviewMetadata", {
+            submissionID,
+            nominalCode: value,
+            isAutoCategorised: false
+          });
+          if (state.selectedDocumentID === submissionID) {
+            renderDocumentDetail();
+          }
+        }
+
+        function publishDocument(submissionID) {
+          const submission = state.submissions.find(item => item.id === submissionID);
+          if (!submission) return;
+
+          const selectedNominal = state.nominalSelections[submissionID];
+          if (!selectedNominal) {
+            openJentryModal("Choose a nominal code before publishing this document.");
+            return;
+          }
+
+          if (submission.publishState === "Published") {
+            openJentryModal(`${submission.doc} is already published to Xero.`);
+            return;
+          }
+
+          postNative("updateReviewMetadata", {
+            submissionID,
+            nominalCode: selectedNominal,
+            isAutoCategorised: false
+          });
+          postNative("publishSubmission", { submissionID });
+          openJentryModal(`Publishing ${submission.doc} to Xero using ${selectedNominal}.`);
+        }
+
+        function archiveDocument(submissionID, filename) {
+          postNative("archiveSubmission", { submissionID });
+          openJentryModal(`Moving ${filename} into Archive.`);
+        }
+
+        function retrySubmission(submissionID, filename) {
+          postNative("retrySubmission", { submissionID });
+          openJentryModal(`Retrying ${filename}.`);
+        }
+
+        function renderWorkspaceHeader() {
+          const client = selectedClient();
+          if (!client) return;
+
+          const clientDocuments = documentsForClient(client.id);
+          const inboxDocuments = clientDocuments.filter(submission => submission.isInbox);
+          const archiveDocuments = clientDocuments.filter(submission => submission.isArchived);
+          const ready = inboxDocuments.filter(submission => submission.publishState === "Ready" || submission.publishState === "Review").length;
+          const published = archiveDocuments.length;
+          const blocked = inboxDocuments.filter(submission => submission.publishState === "Blocked").length;
+
+          workspaceBreadcrumb.innerText = client.name;
+          workspaceTitle.innerText = `${client.name} Document Workspace`;
+          workspaceSummary.innerText = state.activeWorkspaceScreen === "archive"
+            ? `Archive shows completed documents for ${client.name}. If Inbox is clear and everything sits here, this client is fully up to date. Last updated ${state.lastUpdated}.`
+            : `Inbox shows every active document for ${client.name}: submitted, processing, extracted, review, failed, or still waiting to publish. Last updated ${state.lastUpdated}.`;
+          workspaceDocumentSubtitle.innerText = state.activeWorkspaceScreen === "archive"
+            ? `Showing ${archiveDocuments.length} archived documents for ${client.name}.`
+            : `Showing ${inboxDocuments.length} inbox documents for ${client.name}.`;
+          workspaceInboxEmail.innerText = client.email;
+          workspaceScreenSwitcher.innerHTML = `
+            <button class="jentry-inline-btn ${state.activeWorkspaceScreen === "inbox" ? "active" : ""}" onclick="setWorkspaceScreen('inbox')">Inbox (${inboxDocuments.length})</button>
+            <button class="jentry-inline-btn ${state.activeWorkspaceScreen === "archive" ? "active" : ""}" onclick="setWorkspaceScreen('archive')">Archive (${archiveDocuments.length})</button>
+          `;
+
+          workspaceStats.innerHTML = `
+            <div class="jentry-summary-card"><span>Total documents</span><strong>${clientDocuments.length}</strong></div>
+            <div class="jentry-summary-card"><span>Inbox</span><strong>${inboxDocuments.length}</strong></div>
+            <div class="jentry-summary-card"><span>Archive</span><strong>${archiveDocuments.length}</strong></div>
+            <div class="jentry-summary-card"><span>Ready / Review</span><strong>${ready}</strong></div>
+            <div class="jentry-summary-card"><span>Blocked</span><strong>${blocked}</strong></div>
+          `;
+
+          clientControlGrid.innerHTML = `
+            <div class="jentry-detail-item"><span>Inbound email</span><div>${client.email}</div></div>
+            <div class="jentry-detail-item"><span>Workspace status</span><div>${client.status}</div></div>
+            <div class="jentry-detail-item"><span>Latest supplier</span><div>${client.lastSupplier}</div></div>
+            <div class="jentry-detail-item"><span>Last activity</span><div>${client.lastActivity}</div></div>
+          `;
+
+          clientControlNote.innerText = client.inboxCount === 0
+            ? "Inbox is clear. Everything remaining for this client sits in Archive, so this workspace is up to date."
+            : "Work through Inbox until it is clear. Active documents stay in Inbox until they are processed and can be moved aside into Archive.";
+        }
+
+        function renderWorkspaceRows() {
+          const rows = filteredDocuments();
+
+          if (!rows.length) {
+            workspaceRows.innerHTML = `<tr><td colspan="9"><div class="jentry-empty">No documents match the current workspace filters.</div></td></tr>`;
+            return;
+          }
+
+          workspaceRows.innerHTML = rows.map(submission => `
+            <tr class="${state.selectedDocumentID === submission.id ? "active" : ""}" onclick="selectDocument('${submission.id}')">
+              <td>${statusBadge(submission.publishState)}</td>
+              <td>${submission.documentDate}<span class="jentry-subtitle">${submission.received}</span></td>
+              <td><span class="jentry-cell-title">${submission.supplier}</span><span class="jentry-subtitle">${submission.by}</span></td>
+              <td><span class="jentry-cell-title">${submission.doc}</span><span class="jentry-subtitle">${submission.documentType}</span></td>
+              <td>${submission.totalAmount}<span class="jentry-subtitle">VAT ${submission.taxAmount}</span></td>
+              <td>${submission.taxRate}</td>
+              <td onclick="event.stopPropagation()">
+                <div class="jentry-nominal-cell">
+                  ${submission.isAutoCategorised ? `<span class="jentry-auto-pill" title="Auto categorised by Jentry"><strong>🧠</strong> Suggested</span>` : ""}
+                  <select class="jentry-select" onchange="onNominalCodeChange('${submission.id}', this.value)">
+                    ${nominalCodeOptions.map(option => `<option value="${option}" ${state.nominalSelections[submission.id] === option ? "selected" : ""}>${option}</option>`).join("")}
+                  </select>
+                </div>
+              </td>
+              <td>${statusBadge(submission.matchStatus)}</td>
+              <td class="jentry-row-publish" onclick="event.stopPropagation()">
+                <div class="jentry-row-actions">
+                  ${submission.isArchived ? `<button class="jentry-inline-btn" onclick="openJentryModal('${submission.doc} is already archived and completed.')">Archived</button>` : `<button class="jentry-btn" onclick="publishDocument('${submission.id}')">Publish</button>`}
+                  ${submission.isArchived === false && submission.publishState === "Ready" ? `<button class="jentry-inline-btn" onclick="archiveDocument('${submission.id}', '${submission.doc}')">Archive</button>` : ""}
+                  ${submission.canRetry ? `<button class="jentry-inline-btn" onclick="retrySubmission('${submission.id}', '${submission.doc}')">Retry</button>` : ""}
+                </div>
+              </td>
+            </tr>
+          `).join("");
+        }
+
+        function renderDocumentDetail() {
+          const submission = selectedDocument();
+          const client = selectedClient();
+
+          if (!submission || !client) {
+            detailTitle.innerText = "Document details";
+            detailSubtitle.innerText = "Select a row to inspect the document before you publish it.";
+            detailBody.innerHTML = "No document selected.";
+            return;
+          }
+
+          detailTitle.innerText = submission.doc;
+          detailSubtitle.innerText = `${submission.supplier} · ${submission.documentType} · ${submission.received}`;
+
+          detailBody.innerHTML = `
+            <div class="jentry-row-actions" style="justify-content:space-between;">
+              ${statusBadge(submission.publishState)}
+              ${statusBadge(submission.source)}
+            </div>
+
+            <div class="jentry-detail-grid">
+              <div class="jentry-detail-item"><span>Client</span><strong>${client.name}</strong></div>
+              <div class="jentry-detail-item"><span>Supplier</span><strong>${submission.supplier}</strong></div>
+              <div class="jentry-detail-item"><span>Total amount</span><strong>${submission.totalAmount}</strong></div>
+              <div class="jentry-detail-item"><span>Tax amount</span><strong>${submission.taxAmount}</strong></div>
+              <div class="jentry-detail-item"><span>Tax rate</span><strong>${submission.taxRate}</strong></div>
+              <div class="jentry-detail-item"><span>Suggested nominal</span><strong>${state.nominalSelections[submission.id]}</strong><div style="margin-top:8px;">${submission.isAutoCategorised ? `<span class="jentry-auto-pill" title="Auto categorised by Jentry"><strong>🧠</strong> Auto categorised by Jentry</span>` : ""}</div></div>
+              <div class="jentry-detail-item"><span>Workflow status</span><strong>${submission.processing}</strong></div>
+              <div class="jentry-detail-item"><span>Xero state</span><strong>${submission.xero}</strong></div>
+              <div class="jentry-detail-item"><span>Submitted by</span><div>${submission.by}</div></div>
+              <div class="jentry-detail-item"><span>Email</span><div>${submission.email}</div></div>
+            </div>
+
+            <div class="jentry-note">
+              <strong>Issue / review note</strong><br>
+              ${submission.issue}
+            </div>
+
+            <div class="jentry-row-actions" style="margin-top:18px;">
+              ${submission.isArchived ? `<button class="jentry-inline-btn" onclick="openJentryModal('${submission.doc} is already in Archive.')">Archived Document</button>` : `<button class="jentry-btn" onclick="publishDocument('${submission.id}')">Publish Document</button>`}
+              ${submission.isArchived === false && submission.publishState === "Ready" ? `<button class="jentry-inline-btn" onclick="archiveDocument('${submission.id}', '${submission.doc}')">Move To Archive</button>` : ""}
+              ${submission.canRetry ? `<button class="jentry-inline-btn" onclick="retrySubmission('${submission.id}', '${submission.doc}')">Retry Processing</button>` : ""}
+            </div>
+          `;
+        }
+
+        function renderWorkspace() {
+          const client = selectedClient();
+          if (!client) {
+            showDirectory();
+            return;
+          }
+
+          renderWorkspaceHeader();
+
+          const visibleRows = filteredDocuments();
+          if (!visibleRows.find(item => item.id === state.selectedDocumentID)) {
+            state.selectedDocumentID = visibleRows[0]?.id || null;
+          }
+
+          renderWorkspaceRows();
+          renderDocumentDetail();
+        }
+
+        function openJentryModal(text) {
+          jentryModalText.innerText = text;
+          jentryModal.classList.add("active");
+        }
+
+        function closeJentryModal() {
+          jentryModal.classList.remove("active");
+        }
+
+        function renderAll() {
+          normaliseNominalSelections();
+          renderDirectory();
+
+          if (state.selectedClientID && state.clients.find(client => client.id === state.selectedClientID)) {
+            renderWorkspace();
+          } else {
+            showDirectory();
+          }
+        }
+
+        window.JentryPortal = {
+          setState(nextState) {
+            state.isLoading = nextState.isLoading;
+            state.errorMessage = nextState.errorMessage;
+            state.workspace = nextState.workspace;
+            state.stats = nextState.stats;
+            state.statuses = nextState.statuses;
+            state.submissions = nextState.submissions || [];
+            state.clients = nextState.clients || [];
+            state.users = nextState.users || [];
+            state.lastUpdated = nextState.lastUpdated || "";
+
+            if (!state.selectedClientID && state.clients[0]) {
+              state.selectedClientID = state.clients[0].id;
+            }
+
+            renderAll();
+
+            if (state.errorMessage) {
+              openJentryModal(state.errorMessage);
+            }
+          }
+        };
+
+        renderAll();
+    </script>
+</body>
+</html>

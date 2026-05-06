@@ -2,9 +2,39 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>co.jaccountancy.jentry.inbound-email-refresh</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>co.jaccountancy.jentry.oauth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>jentry</string>
+			</array>
+		</dict>
+	</array>
+	<key>JENTRYBackendAnalysisURL</key>
+	<string>https://jentry-jentry.up.railway.app/analyze</string>
+	<key>JENTRYBackendBearerToken</key>
+	<string></string>
+	<key>JENTRYBackendBaseURL</key>
+	<string>https://jentry-jentry.up.railway.app</string>
+	<key>JENTRYBackendProblemReportURL</key>
+	<string>https://jentry-jentry.up.railway.app/problem-report</string>
+	<key>JENTRYBackendSenderEmail</key>
+	<string>theteam@jaccountancy.co.uk</string>
+	<key>JENTRYBackendUploadURL</key>
+	<string>https://jentry-jentry.up.railway.app/jentry/uploads</string>
+	<key>JENTRYXeroAppCallbackURL</key>
+	<string>jentry://oauth/xero/callback</string>
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>remote-notification</string>
+		<string>fetch</string>
+		<string>processing</string>
 	</array>
 </dict>
 </plist>
