@@ -2242,6 +2242,229 @@ app.post("/api/v1/submissions/:submissionId/mark-ready", requireAdminUserOrContr
     }
 });
 
+app.patch("/api/v1/submissions/:submissionId/review-metadata", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const submissionId = normalizeOptionalString(request.params.submissionId);
+        const nominalCode = normalizeOptionalString(request.body?.nominalCode);
+        const isAutoCategorised = request.body?.isAutoCategorised === true;
+
+        if (!submissionId || !nominalCode) {
+            response.status(400).json({ message: "Missing submissionId or nominalCode." });
+            return;
+        }
+
+        const result = await pool.query(
+            `
+            UPDATE processed_inbound_submissions
+            SET nominal_code = $2,
+                is_auto_categorised = $3
+            WHERE id = $1
+            RETURNING *
+            `,
+            [submissionId, nominalCode, isAutoCategorised]
+        );
+
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Submission not found." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "submission.review_metadata_updated",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Updated submission review metadata",
+                submissionId,
+                nominalCode,
+                isAutoCategorised
+            }
+        });
+
+        response.json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update review metadata." });
+    }
+});
+
+app.post("/api/v1/submissions/:submissionId/publish", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const submissionId = normalizeOptionalString(request.params.submissionId);
+
+        const result = await pool.query(
+            `
+            UPDATE processed_inbound_submissions
+            SET status = 'published',
+                archived_at = COALESCE(archived_at, now())
+            WHERE id = $1
+            RETURNING *
+            `,
+            [submissionId]
+        );
+
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Submission not found." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "submission.published",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Published submission",
+                submissionId
+            }
+        });
+
+        response.json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to publish submission." });
+    }
+});
+
+app.post("/api/v1/submissions/:submissionId/archive", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const submissionId = normalizeOptionalString(request.params.submissionId);
+
+        const result = await pool.query(
+            `
+            UPDATE processed_inbound_submissions
+            SET archived_at = COALESCE(archived_at, now())
+            WHERE id = $1
+            RETURNING *
+            `,
+            [submissionId]
+        );
+
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Submission not found." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "submission.archived",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Archived submission",
+                submissionId
+            }
+        });
+
+        response.json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to archive submission." });
+    }
+});
+
+app.post("/api/v1/submissions", requireAdminUserOrControlPanelToken, upload.any(), async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const files = Array.isArray(request.files) ? request.files : [];
+        const file = files[0];
+
+        if (!file?.buffer) {
+            response.status(400).json({ message: "Missing uploaded file." });
+            return;
+        }
+
+        const requestedAccountId = normalizeOptionalString(request.body?.accountId) || normalizeOptionalString(request.body?.workspaceID);
+        const workspaceRows = await listAdminWorkspaces();
+        const selectedWorkspace = requestedAccountId
+            ? workspaceRows.find((row) => row.accountID === requestedAccountId)
+            : workspaceRows[0];
+
+        if (!selectedWorkspace?.accountID) {
+            response.status(400).json({ message: "No client workspace is available for upload." });
+            return;
+        }
+
+        const extraction = await analyzeReceiptWithOpenAI({
+            buffer: file.buffer,
+            mimeType: file.mimetype || "application/pdf",
+            capturedAt: new Date().toISOString(),
+            analysisContext: {
+                companyName: selectedWorkspace.companyName || "Jentry Client",
+                chartOfAccounts: []
+            }
+        });
+
+        const extractedDocument = {
+            ...extraction,
+            sourceFilename: file.originalname || null,
+            sourceMimeType: file.mimetype || null
+        };
+
+        const submissionId = crypto.randomUUID();
+        await createProcessedInboundSubmission({
+            submissionId,
+            accountId: selectedWorkspace.accountID,
+            extractedDocuments: [extractedDocument],
+            attachments: [file],
+            nominalCode:
+                normalizeOptionalString(extraction.selectedNominalCode) ||
+                normalizeOptionalString(extraction.nominalCode) ||
+                normalizeOptionalString(extraction.accountCode) ||
+                null,
+            isAutoCategorised: true
+        });
+
+        const result = await pool.query(
+            `
+            SELECT
+                p.id,
+                p.account_id,
+                p.title,
+                p.summary,
+                p.extracted_documents,
+                p.status,
+                p.nominal_code,
+                p.is_auto_categorised,
+                p.archived_at,
+                p.created_at,
+                a.company_name,
+                ji.inbox_email,
+                u.email AS assigned_user_email,
+                xc.tenant_id,
+                xc.is_connected,
+                xc.requires_reconnect
+            FROM processed_inbound_submissions p
+            LEFT JOIN accounts a ON a.id = p.account_id
+            LEFT JOIN jentry_inboxes ji ON ji.account_id = a.id AND ji.is_active = true
+            LEFT JOIN users u ON u.id = a.assigned_user_id
+            LEFT JOIN xero_connections xc ON xc.account_id = a.id
+            WHERE p.id = $1
+            LIMIT 1
+            `,
+            [submissionId]
+        );
+
+        await writeAdminAuditLog(request, {
+            action: "submission.uploaded",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Uploaded submission",
+                submissionId,
+                accountId: selectedWorkspace.accountID,
+                filename: file.originalname || null
+            }
+        });
+
+        response.status(201).json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to upload submission." });
+    }
+});
+
 app.patch("/api/v1/workspaces/:accountId", requireAdminUserOrControlPanelToken, async (request, response) => {
     try {
         await ensureCoreModelTables();
@@ -3201,6 +3424,9 @@ async function buildCompatibilityDashboardPayload() {
             p.summary,
             p.extracted_documents,
             p.status,
+            p.nominal_code,
+            p.is_auto_categorised,
+            p.archived_at,
             p.created_at,
             a.company_name,
             ji.inbox_email,
@@ -3237,6 +3463,18 @@ function mapCompatibilitySubmissionRow(row) {
     const status = normalizeOptionalString(row.status);
     const extractedDocuments = Array.isArray(row.extracted_documents) ? row.extracted_documents : [];
     const firstDocument = extractedDocuments[0] || {};
+    const explicitNominalCode =
+        normalizeOptionalString(row.nominal_code) ||
+        normalizeOptionalString(firstDocument.selectedNominalCode) ||
+        normalizeOptionalString(firstDocument.nominalCode) ||
+        normalizeOptionalString(firstDocument.accountCode);
+    const totalAmount = Number(firstDocument.totalAmount);
+    const vatAmount = Number(firstDocument.vatAmount);
+    const safeTotalAmount = Number.isFinite(totalAmount) ? totalAmount : null;
+    const safeVATAmount = Number.isFinite(vatAmount) ? vatAmount : null;
+    const safeNetAmount = safeTotalAmount != null && safeVATAmount != null
+        ? Math.max(safeTotalAmount - safeVATAmount, 0)
+        : safeTotalAmount;
 
     let normalizedStatus = "processing";
     let xeroStatus = "not_sent";
@@ -3265,8 +3503,22 @@ function mapCompatibilitySubmissionRow(row) {
         emailSubject: normalizeOptionalString(row.summary) || normalizeOptionalString(row.title) || null,
         status: normalizedStatus,
         xeroStatus,
+        nominalCode: explicitNominalCode || null,
+        isAutoCategorised: row.is_auto_categorised !== false,
+        archivedAt: row.archived_at || null,
         createdAt: row.created_at,
-        extractedData: null,
+        extractedData: {
+            supplierName: normalizeOptionalString(firstDocument.merchant) || row.company_name || "Unknown supplier",
+            invoiceNumber: normalizeOptionalString(firstDocument.invoiceNumber) || "",
+            invoiceDate: normalizeOptionalString(firstDocument.dateISO) || "",
+            dueDate: normalizeOptionalString(firstDocument.dateISO) || "",
+            netAmount: safeNetAmount ?? 0,
+            vatAmount: safeVATAmount ?? 0,
+            grossAmount: safeTotalAmount ?? 0,
+            currency: normalizeOptionalString(firstDocument.currency) || "GBP",
+            category: normalizeOptionalString(firstDocument.category) || "",
+            confidence: Number(firstDocument.extractionConfidence) || Number(firstDocument.codingConfidence) || 0
+        },
         errorMessage,
         companyName: row.company_name || null,
         inboxEmail: row.inbox_email || null,
@@ -3691,9 +3943,15 @@ async function ensureProcessedInboundSubmissionsTable() {
             summary text,
             extracted_documents jsonb NOT NULL,
             status text NOT NULL DEFAULT 'ready',
+            nominal_code text,
+            is_auto_categorised boolean NOT NULL DEFAULT true,
+            archived_at timestamptz,
             created_at timestamptz NOT NULL DEFAULT now()
         )
     `);
+    await pool.query(`ALTER TABLE processed_inbound_submissions ADD COLUMN IF NOT EXISTS nominal_code text`);
+    await pool.query(`ALTER TABLE processed_inbound_submissions ADD COLUMN IF NOT EXISTS is_auto_categorised boolean NOT NULL DEFAULT true`);
+    await pool.query(`ALTER TABLE processed_inbound_submissions ADD COLUMN IF NOT EXISTS archived_at timestamptz`);
 }
 
 async function createInboundEmailSubmission({ accountId, inboxEmail, payload }) {
@@ -3767,7 +4025,9 @@ async function createProcessedInboundSubmission({
     submissionId,
     accountId,
     extractedDocuments = [],
-    attachments = []
+    attachments = [],
+    nominalCode = null,
+    isAutoCategorised = true
 }) {
     await ensureProcessedInboundSubmissionsTable();
 
@@ -3790,15 +4050,17 @@ async function createProcessedInboundSubmission({
     await pool.query(
         `
         INSERT INTO processed_inbound_submissions (
-            id, account_id, title, summary, extracted_documents, status
-        ) VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            id, account_id, title, summary, extracted_documents, status, nominal_code, is_auto_categorised
+        ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)
         ON CONFLICT (id)
         DO UPDATE SET
             account_id = EXCLUDED.account_id,
             title = EXCLUDED.title,
             summary = EXCLUDED.summary,
             extracted_documents = EXCLUDED.extracted_documents,
-            status = EXCLUDED.status
+            status = EXCLUDED.status,
+            nominal_code = COALESCE(EXCLUDED.nominal_code, processed_inbound_submissions.nominal_code),
+            is_auto_categorised = EXCLUDED.is_auto_categorised
         `,
         [
             submissionId,
@@ -3806,7 +4068,9 @@ async function createProcessedInboundSubmission({
             title,
             summary,
             JSON.stringify(extractedDocuments),
-            "ready"
+            "ready",
+            nominalCode,
+            isAutoCategorised
         ]
     );
 }
