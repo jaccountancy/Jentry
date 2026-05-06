@@ -29,6 +29,7 @@ const optionalEnvironmentVariables = {
     openAIAPIKey: process.env.OPENAI_API_KEY?.trim() || "",
     openAIModel: process.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini"
 };
+const JENTRY_CONTROL_PANEL_API_TOKEN = process.env.JENTRY_CONTROL_PANEL_API_TOKEN?.trim() || "";
 
 const SERVER_SUPER_ADMIN_EMAILS = new Set(
     (process.env.SERVER_SUPER_ADMIN_EMAILS || "")
@@ -555,6 +556,41 @@ async function requireAdminUser(request, response, next) {
             response.status(403).json({ code: "ADMIN_FORBIDDEN", message: "Super admin access required." });
             return;
         }
+        next();
+    });
+}
+
+function hasValidControlPanelToken(request) {
+    if (!JENTRY_CONTROL_PANEL_API_TOKEN) {
+        return false;
+    }
+
+    const authorization = normalizeOptionalString(request.headers.authorization);
+    if (!authorization || !authorization.toLowerCase().startsWith("bearer ")) {
+        return false;
+    }
+
+    const token = authorization.slice(7).trim();
+    return token === JENTRY_CONTROL_PANEL_API_TOKEN;
+}
+
+async function requireAdminUserOrControlPanelToken(request, response, next) {
+    if (hasValidControlPanelToken(request)) {
+        request.authenticatedUser = {
+            id: null,
+            email: "control-panel-token@jentry.local",
+            displayName: "Jentry Control Panel",
+            role: "super_admin",
+            isSuperAdmin: true,
+            isSuspended: false
+        };
+        request.superAdminEmail = request.authenticatedUser.email;
+        next();
+        return;
+    }
+
+    await requireAdminUser(request, response, async () => {
+        request.superAdminEmail = normalizeEmail(request.authenticatedUser?.email) || null;
         next();
     });
 }
@@ -1806,7 +1842,7 @@ app.post("/xero/ensure-contact", async (req, res) => {
 
 
 
-app.use("/admin", requireAuthenticatedUser, requireSuperAdmin);
+app.use("/admin", requireAdminUserOrControlPanelToken);
 
 app.get("/admin/overview", async (_request, response) => {
     try {
@@ -2123,6 +2159,173 @@ app.get("/admin/activity", async (_request, response) => {
         response.json({ activity: result.rows.map(mapAuditRow) });
     } catch (error) {
         response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load activity." });
+    }
+});
+
+app.get("/api/v1/dashboard", requireAdminUserOrControlPanelToken, async (_request, response) => {
+    try {
+        response.json(await buildCompatibilityDashboardPayload());
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to load dashboard." });
+    }
+});
+
+app.post("/api/v1/submissions/:submissionId/retry", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const submissionId = normalizeOptionalString(request.params.submissionId);
+        const result = await pool.query(
+            `
+            UPDATE processed_inbound_submissions
+            SET status = 'ready'
+            WHERE id = $1
+            RETURNING *
+            `,
+            [submissionId]
+        );
+
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Submission not found." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "submission.retried",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Retried submission",
+                submissionId
+            }
+        });
+
+        response.json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to retry submission." });
+    }
+});
+
+app.post("/api/v1/submissions/:submissionId/mark-ready", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureProcessedInboundSubmissionsTable();
+        const submissionId = normalizeOptionalString(request.params.submissionId);
+        const result = await pool.query(
+            `
+            UPDATE processed_inbound_submissions
+            SET status = 'ready'
+            WHERE id = $1
+            RETURNING *
+            `,
+            [submissionId]
+        );
+
+        if (!result.rows[0]) {
+            response.status(404).json({ message: "Submission not found." });
+            return;
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "submission.mark_ready",
+            targetType: "submission",
+            targetId: submissionId,
+            details: {
+                category: "submissions",
+                actionTitle: "Marked submission ready",
+                submissionId
+            }
+        });
+
+        response.json(mapCompatibilitySubmissionRow(result.rows[0]));
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to mark submission ready." });
+    }
+});
+
+app.patch("/api/v1/workspaces/:accountId", requireAdminUserOrControlPanelToken, async (request, response) => {
+    try {
+        await ensureCoreModelTables();
+        const accountId = normalizeOptionalString(request.params.accountId);
+        const inboxEmail =
+            normalizeEmail(request.body?.jentryInboundEmail) ||
+            normalizeEmail(request.body?.inboxEmail) ||
+            normalizeEmail(request.body?.email);
+
+        if (!accountId || !inboxEmail) {
+            response.status(400).json({ message: "Missing accountId or jentryInboundEmail." });
+            return;
+        }
+
+        const accountResult = await pool.query(
+            `
+            SELECT a.id, a.company_name, a.assigned_user_id, u.email AS assigned_user_email
+            FROM accounts a
+            LEFT JOIN users u ON u.id = a.assigned_user_id
+            WHERE a.id = $1
+            LIMIT 1
+            `,
+            [accountId]
+        );
+
+        const account = accountResult.rows[0];
+        if (!account) {
+            response.status(404).json({ message: "Workspace not found." });
+            return;
+        }
+
+        const existingInbox = await pool.query(
+            `SELECT id FROM jentry_inboxes WHERE account_id = $1 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1`,
+            [accountId]
+        );
+
+        if (existingInbox.rows[0]?.id) {
+            await pool.query(
+                `
+                UPDATE jentry_inboxes
+                SET inbox_email = $2,
+                    is_active = true,
+                    updated_by = $3,
+                    updated_at = now()
+                WHERE id = $1
+                `,
+                [
+                    existingInbox.rows[0].id,
+                    inboxEmail,
+                    request.superAdminEmail || request.authenticatedUser?.email || "control-panel-token@jentry.local"
+                ]
+            );
+        } else {
+            await upsertJentryInboxRecord({
+                accountId,
+                inboxEmail,
+                assignedUserEmail: account.assigned_user_email || null,
+                assignedUserId: account.assigned_user_id || null,
+                updatedBy: request.superAdminEmail || request.authenticatedUser?.email || "control-panel-token@jentry.local",
+                isActive: true
+            });
+        }
+
+        await writeAdminAuditLog(request, {
+            action: "workspace.registry_updated",
+            targetType: "workspace",
+            targetId: accountId,
+            details: {
+                category: "registry",
+                actionTitle: "Updated workspace inbox email",
+                targetName: account.company_name || accountId,
+                afterSummary: inboxEmail
+            }
+        });
+
+        response.json({
+            id: accountId,
+            companyName: account.company_name || accountId,
+            jentryInboundEmail: inboxEmail,
+            xeroTenantID: null,
+            xeroConnectionStatus: "connected"
+        });
+    } catch (error) {
+        response.status(500).json({ message: error instanceof Error ? error.message : "Unable to update workspace." });
     }
 });
 
@@ -2982,6 +3185,95 @@ async function deleteWorkspace({ accountId, actorEmail, request } = {}) {
 
 function normalizeRequiredAdminString(value) {
     return normalizeOptionalString(value);
+}
+
+async function buildCompatibilityDashboardPayload() {
+    await ensureCoreModelTables();
+    await ensureProcessedInboundSubmissionsTable().catch(() => undefined);
+
+    const workspaceRows = await listAdminWorkspaces();
+    const submissionsResult = await pool.query(
+        `
+        SELECT
+            p.id,
+            p.account_id,
+            p.title,
+            p.summary,
+            p.extracted_documents,
+            p.status,
+            p.created_at,
+            a.company_name,
+            ji.inbox_email,
+            u.email AS assigned_user_email,
+            xc.tenant_id,
+            xc.is_connected,
+            xc.requires_reconnect
+        FROM processed_inbound_submissions p
+        LEFT JOIN accounts a ON a.id = p.account_id
+        LEFT JOIN jentry_inboxes ji ON ji.account_id = a.id AND ji.is_active = true
+        LEFT JOIN users u ON u.id = a.assigned_user_id
+        LEFT JOIN xero_connections xc ON xc.account_id = a.id
+        ORDER BY p.created_at DESC
+        LIMIT 250
+        `
+    );
+
+    const connectedCount = workspaceRows.filter((row) => row.isConnectedToXero && !row.requiresReconnect).length;
+    const primaryWorkspace = workspaceRows[0] || {};
+
+    return {
+        workspace: {
+            id: primaryWorkspace.accountID || "staff-control-panel",
+            companyName: "Jentry Staff Control",
+            jentryInboundEmail: primaryWorkspace.jentryInboxEmail || "team@jaccountancy.co.uk",
+            xeroTenantID: primaryWorkspace.xeroOrganisationID || null,
+            xeroConnectionStatus: connectedCount > 0 ? "connected" : "disconnected"
+        },
+        submissions: submissionsResult.rows.map(mapCompatibilitySubmissionRow)
+    };
+}
+
+function mapCompatibilitySubmissionRow(row) {
+    const status = normalizeOptionalString(row.status);
+    const extractedDocuments = Array.isArray(row.extracted_documents) ? row.extracted_documents : [];
+    const firstDocument = extractedDocuments[0] || {};
+
+    let normalizedStatus = "processing";
+    let xeroStatus = "not_sent";
+    let errorMessage = null;
+
+    if (status === "failed") {
+        normalizedStatus = "failed";
+        xeroStatus = "failed";
+        errorMessage = "Processing failed.";
+    } else if (status === "ready") {
+        normalizedStatus = "ready_for_xero";
+        xeroStatus = "ready";
+    } else if (status === "processed" || status === "published") {
+        normalizedStatus = "exported";
+        xeroStatus = "exported";
+    }
+
+    return {
+        id: row.id,
+        workspaceID: row.account_id,
+        userID: null,
+        source: "inbound_email",
+        originalFilename: normalizeOptionalString(firstDocument.sourceFilename) || normalizeOptionalString(row.title) || "Email submission",
+        fileURL: null,
+        emailFrom: row.assigned_user_email || null,
+        emailSubject: normalizeOptionalString(row.summary) || normalizeOptionalString(row.title) || null,
+        status: normalizedStatus,
+        xeroStatus,
+        createdAt: row.created_at,
+        extractedData: null,
+        errorMessage,
+        companyName: row.company_name || null,
+        inboxEmail: row.inbox_email || null,
+        requiresReconnect: Boolean(row.requires_reconnect),
+        isConnectedToXero: Boolean(row.is_connected),
+        tenantId: row.tenant_id || null
+    };
 }
 
 function mapAdminWorkspaceRow(row) {
